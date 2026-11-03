@@ -437,9 +437,12 @@ if [ "$WECHAT_BRIDGE" = "1" ]; then
   fi
 
   # 构建（node:22-slim 走已配置的镜像加速链；层缓存使重跑秒级）
-  if [ -f "$A2W_SRC/docker/Dockerfile" ]; then
-    echo "  构建桥镜像 $A2W_IMAGE（首次约 1-5 分钟）..."
-    if timeout 900 docker build -t "$A2W_IMAGE" -f "$A2W_SRC/docker/Dockerfile" "$A2W_SRC" >/tmp/a2w-build.log 2>&1; then
+  if docker image inspect "$A2W_IMAGE" >/dev/null 2>&1; then
+    BRIDGE_OK=1
+    ok "桥镜像已存在，跳过构建"
+  elif [ -f "$A2W_SRC/docker/Dockerfile" ]; then
+    echo "  构建桥镜像 $A2W_IMAGE（慢镜像站可能需 10-20 分钟，层缓存断点续拉）..."
+    if timeout 1800 docker build -t "$A2W_IMAGE" -f "$A2W_SRC/docker/Dockerfile" "$A2W_SRC" >/tmp/a2w-build.log 2>&1; then
       BRIDGE_OK=1
       ok "桥镜像构建完成"
     else
