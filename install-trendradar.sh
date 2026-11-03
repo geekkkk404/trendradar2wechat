@@ -253,10 +253,15 @@ elif [ -e "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
   die "目录 $DEST 已存在且非本脚本安装，请更换 --dir 或先清理"
 else
   GOT=0
-  for prefix in "" "${GH_PROXY_FALLBACKS[@]}"; do
-    url="${prefix:+$prefix/}$REPO_URL.git"
-    echo "  克隆: $url"
-    if timeout 180 git clone --depth 1 -b "$REPO_BRANCH" "$url" "$DEST" >/dev/null 2>&1; then GOT=1; break; fi
+  # 社区代理存在分钟级抖动（实测全灭后数十秒内即恢复）：全链失败后整链重试一轮
+  for round in 1 2; do
+    for prefix in "" "${GH_PROXY_FALLBACKS[@]}"; do
+      url="${prefix:+$prefix/}$REPO_URL.git"
+      echo "  克隆: $url"
+      if timeout 180 git clone --depth 1 -b "$REPO_BRANCH" "$url" "$DEST" >/dev/null 2>&1; then GOT=1; break; fi
+    done
+    [ "$GOT" = "1" ] && break
+    [ "$round" = "1" ] && { echo "  全部克隆源失败，30 秒后整链重试..."; sleep 30; }
   done
   [ "$GOT" = "1" ] || die "源码克隆失败（网络问题），请重跑本脚本重试"
   ok "克隆完成"
