@@ -314,7 +314,7 @@ setup_mirrors() {
   local candidates=() m probe_url final code json="[" first=1
   # 腾讯内网镜像无条件收录（内网域名探测易受瞬时因素干扰；即使不可达，docker 也会按序回退）
   if [ "$REGION" = "tencent" ]; then
-    json="\"http://$TENCENT_INTERNAL_MIRROR\""; first=0
+    json="${json}\"http://$TENCENT_INTERNAL_MIRROR\""; first=0
   fi
   for m in "${REGISTRY_MIRRORS_CANDIDATES[@]}"; do candidates+=("$m"); done
   for m in "${candidates[@]}"; do
@@ -334,9 +334,21 @@ setup_mirrors() {
   [ -f /etc/docker/daemon.json ] && cp /etc/docker/daemon.json "/etc/docker/daemon.json.bak.$(date +%s)"
   mkdir -p /etc/docker
   printf '{ "registry-mirrors": %s }\n' "$json" > /etc/docker/daemon.json
-  systemctl restart docker 2>/dev/null || service docker restart 2>/dev/null || die "Docker 重启失败"
-  sleep 2
-  ok "镜像加速已配置: $(echo "$json" | tr -d '"[]')"
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl reset-failed docker 2>/dev/null || true
+  systemctl restart docker 2>/dev/null || service docker restart 2>/dev/null || true
+  # systemd Type=notify 握手偶发超时误报、配置错误真失败——一律以 docker 实际活性为准（30 秒轮询）
+  ROK=0
+  for i in $(seq 1 10); do
+    if docker info >/dev/null 2>&1; then ROK=1; break; fi
+    sleep 3
+  done
+  if [ "$ROK" = "1" ]; then
+    ok "镜像加速已配置: $(echo "$json" | tr -d '"[]')"
+  else
+    journalctl -u docker --no-pager -n 5 2>/dev/null | sed 's/^/  │ /'
+    die "Docker 重启失败（上方为 daemon 日志尾行；可检查 /etc/docker/daemon.json 后重跑）"
+  fi
   return 0
 }
 
