@@ -117,6 +117,7 @@ A2W_BRANCH="main"
 A2W_SRC="$DEST/any2wechat"
 A2W_DATA="$DEST/any2wechat-data"
 A2W_PORT=8788
+TR2W_PORT=8899
 BRIDGE_OK=0
 BRIDGE_AUTHED=0
 NODE_BIN="/usr/local/bin/node"
@@ -125,10 +126,10 @@ NODE_BIN="/usr/local/bin/node"
 if [ "$UNINSTALL" = "1" ]; then
   step "卸载 TrendRadar（目录: $DEST）"
   systemctl disable --now trendradar-fetch.timer >/dev/null 2>&1 || true
-  systemctl disable --now trendradar-web trendradar-fetch trendradar-mcp any2wechat >/dev/null 2>&1 || true
+  systemctl disable --now trendradar-web trendradar-fetch trendradar-mcp any2wechat tr2w-handler >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/trendradar-web.service /etc/systemd/system/trendradar-fetch.service \
         /etc/systemd/system/trendradar-fetch.timer /etc/systemd/system/trendradar-mcp.service \
-        /etc/systemd/system/any2wechat.service
+        /etc/systemd/system/any2wechat.service /etc/systemd/system/tr2w-handler.service
   systemctl daemon-reload 2>/dev/null || true
   rm -f /etc/cron.d/trendradar   # 清理 v0.1.x 实验期遗留（如有）
   ok "服务已停止并移除"
@@ -345,6 +346,11 @@ if [ "$WECHAT_BRIDGE" = "1" ]; then
   # TrendRadar 通用 webhook → 微信桥（原生同机回环）
   upsert_env "GENERIC_WEBHOOK_URL" "http://127.0.0.1:$A2W_PORT/webhook"
   upsert_env "GENERIC_WEBHOOK_TEMPLATE" '{"title":"{title}","content":"{content}"}'
+  # 管家↔桥共享密钥（生成一次持久复用；桥与 tr2w-handler 经此互信）
+  if ! grep -q '^TR2W_RELAY_TOKEN=' "$ENV_FILE"; then
+    upsert_env "TR2W_RELAY_TOKEN" "$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 24)"
+  fi
+  upsert_env "TR2W_RELAY_URL" "http://127.0.0.1:$TR2W_PORT/inbound"
 fi
 ok "配置已写入（保留既有手工配置项）"
 # 载入配置供后续单元写入读取（如 MCP_HOST/MCP_PORT 支持在 env 中自定义）
@@ -534,6 +540,8 @@ ExecStart=$NODE_BIN src/main.mjs
 Environment=BRIDGE_DATA_DIR=$A2W_DATA
 Environment=BRIDGE_HOST=127.0.0.1
 Environment=BRIDGE_PORT=$A2W_PORT
+Environment=BRIDGE_RELAY_URL=http://127.0.0.1:$TR2W_PORT/inbound
+Environment=BRIDGE_RELAY_TOKEN=$TR2W_RELAY_TOKEN
 Restart=always
 RestartSec=30
 
@@ -558,6 +566,601 @@ EOF
       fi
     else
       ok "桥服务已注册（待微信授权后自动上线，期间每 30 秒重试属正常）"
+    fi
+  fi
+fi
+
+# ----------------------------- 微信指令管家（可选，软失败） --------------------
+# tr2w-handler：消费桥的入站转发（BRIDGE_RELAY_*），微信对话式管理 TrendRadar。
+# 安全铁律：只认扫码者本人（双层校验：桥 P-35 守卫 + 本地 owner 比对）；
+# TRCFG1 载荷只是数据——白名单键 + 枚举校验，永不执行其中任何字符串。
+if [ "$WECHAT_BRIDGE" = "1" ] && [ "$BRIDGE_OK" = "1" ]; then
+  step "部署微信指令管家（tr2w-handler，对话式配置）"
+  mkdir -p "$DEST/tr2w"
+
+  cat > "$DEST/tr2w/apply_trcfg.py" <<'PY_APPLY'
+#!/usr/bin/env python3
+"""TRCFG1 apply 核心 —— 白名单补丁 user-config/config.yaml + 重写 frequency_words.txt
+
+设计铁律（trendradar2wechat 账本 D14）：
+  1. 载荷只是数据：只写白名单键、只认枚举值，绝不执行其中任何字符串
+  2. 行级手术式补丁：保留上游 24KB 中文注释原貌（PyYAML 全量重写会抹掉注释，禁用；
+     读配置用 safe_load 只读无妨）
+  3. 写盘前自动备份到 user-config/.backup/（保留最近 30 份）
+上游结构锚点（2026-11-04 master 逐字核实）：
+  schedule.preset / report.mode / report.display_mode 为引号标量；
+  notification.enabled 为暂停/恢复开关；platforms.enabled 是全局布尔（勿动），
+  单平台停用 = 注释 sources 条目（保留 name/domain 便于回启）；
+  rss.feeds 条目带可选 per-feed enabled 键（缺省即启用）。
+"""
+import re
+import shutil
+import time
+from pathlib import Path
+import os
+
+USER_CONFIG = Path(os.environ.get("TR2W_USER_CONFIG", "/opt/TrendRadar/user-config"))
+
+SCHEDULE_PRESETS = {"always_on", "morning_evening", "office_hours", "night_owl", "custom"}
+REPORT_MODES = {"daily", "current", "incremental"}
+DISPLAY_MODES = {"keyword", "platform"}
+# 回执展示用中文名（推送里不出现英文裸值）
+PRESET_ZH = {
+    "always_on": "全天模板",
+    "morning_evening": "早晚报模板（白天照常 + 晚 20-22 点当日汇总）",
+    "office_hours": "办公时间模板（工作日 9-11/13-15/17-19 点，周末 8-23 点）",
+    "night_owl": "夜猫模板（15-17 点、22 点-次日 1 点）",
+    "custom": "自定义模板",
+}
+MODE_ZH = {"current": "实时热榜", "daily": "当日汇总", "incremental": "只推新上榜"}
+DMODE_ZH = {"keyword": "按主题分组", "platform": "按来源分组"}
+KEEP_BACKUPS = 30
+_SECTION = re.compile(r"^([A-Za-z_]+):\s*(?:#.*)?$")
+_ENTRY = re.compile(r"^(\s*)- id:\s*[\"']?([A-Za-z0-9_-]+)[\"']?\s*(?:#.*)?$")
+_ENTRY_C = re.compile(r"^(\s*)#\s*- id:\s*[\"']?([A-Za-z0-9_-]+)[\"']?\s*(?:#.*)?$")
+_WORD_BAD = re.compile(r"(^[\s#！!＋+＠@\[/]|[\r\n])")
+
+
+class ApplyError(Exception):
+    pass
+
+
+def _backup(user_config, names):
+    bdir = user_config / ".backup"
+    bdir.mkdir(exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for n in names:
+        src = user_config / n
+        if src.exists():
+            shutil.copy2(src, bdir / f"{stamp}-{n}")
+    olds = sorted(bdir.iterdir())
+    for f in olds[:-KEEP_BACKUPS] if len(olds) > KEEP_BACKUPS else []:
+        f.unlink()
+
+
+def _lead(ln):
+    return len(ln) - len(ln.lstrip())
+
+
+def _patch_scalar(lines, section, key, value_repr, changes, label):
+    """顶层 section（两格缩进）内替换 `key:` 的值，保留行尾注释；值未变则不动（不产生变化项）。"""
+    cur = None
+    pat = re.compile(r"^(\s+)" + re.escape(key) + r"(\s*:\s*)(.*)$")
+    for i, ln in enumerate(lines):
+        m = _SECTION.match(ln)
+        if m:
+            cur = m.group(1)
+            continue
+        if cur == section:
+            m = pat.match(ln)
+            if m and len(m.group(1)) == 2:
+                comment_m = re.match(r"^(.*?)(\s+#.*)?$", m.group(3))
+                comment = comment_m.group(2) or ""
+                new_line = f"{m.group(1)}{key}{m.group(2)}{value_repr}{comment}"
+                if new_line == ln:
+                    return
+                lines[i] = new_line
+                changes.append(label)
+                return
+    raise ApplyError(f"config.yaml 缺少 {section}.{key}（模板异常），请重跑安装脚本更新模板")
+
+
+def _find_block(lines, pid, commented):
+    """找 - id: "pid" 条目块（活动或注释态），返回 (start, end, indent)；无则 None。
+    end 为块后第一行下标；块 = 起始行 + 缩进更深的续行（含注释态续行）。"""
+    pat = _ENTRY_C if commented else _ENTRY
+    start = None
+    indent = ""
+    for i, ln in enumerate(lines):
+        m = pat.match(ln)
+        if m and m.group(2) == pid:
+            start = i
+            indent = m.group(1)
+            break
+    if start is None:
+        return None
+    base = len(indent)
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        ln = lines[j]
+        if not ln.strip():
+            continue
+        if _SECTION.match(ln):
+            end = j
+            break
+        m2 = _ENTRY.match(ln) or _ENTRY_C.match(ln)
+        if m2 and len(m2.group(1)) <= base:
+            end = j
+            break
+        if _lead(ln) <= base and not ln.lstrip().startswith("#"):
+            end = j
+            break
+        end = j + 1
+    return (start, end, indent)
+
+
+def _toggle_platform(lines, pid, on, changes):
+    cur = _find_block(lines, pid, commented=not on)
+    if cur is None:
+        if _find_block(lines, pid, commented=on) is not None:
+            changes.append(f"平台 {pid} 已是{'启用' if on else '停用'}状态（无变化）")
+            return
+        raise ApplyError(f"未知平台 id: {pid!r}（以 config.yaml 的 sources 为准）")
+    start, end, _indent = cur
+    if on:
+        for i in range(start, end):
+            lines[i] = re.sub(r"^(\s*)#(\s)?", r"\1", lines[i], count=1)
+        changes.append(f"启用平台 {pid}")
+    else:
+        for i in range(start, end):
+            if lines[i].strip():
+                lines[i] = re.sub(r"^(\s*)", r"\1# ", lines[i], count=1)
+        changes.append(f"停用平台 {pid}")
+
+
+def _toggle_feed(lines, fid, on, changes):
+    cur = _find_block(lines, fid, commented=False)
+    if cur is None:
+        raise ApplyError(f"未知 RSS 源 id: {fid!r}")
+    start, end, indent = cur
+    pat = re.compile(r"^(\s+enabled\s*:\s*).*$")
+    want = "true" if on else "false"
+    for i in range(start, end):
+        m = pat.match(lines[i])
+        if m:
+            if lines[i].rstrip().endswith(want):
+                changes.append(f"RSS {fid} 已是{'启用' if on else '停用'}（无变化）")
+            else:
+                lines[i] = f"{m.group(1)}{want}"
+                changes.append(f"{'启用' if on else '停用'} RSS {fid}")
+            return
+    if on:
+        changes.append(f"RSS {fid} 已是启用（无变化）")
+        return
+    lines.insert(end, f"{indent}  enabled: false")
+    changes.append(f"停用 RSS {fid}")
+
+
+def _word(w, what):
+    w = str(w).strip()
+    if not w:
+        raise ApplyError(f"{what}存在空词条")
+    if _WORD_BAD.search(w):
+        raise ApplyError(f"{what}词条含非法字符/语法前缀: {w[:30]!r}")
+    if len(w) > 60:
+        raise ApplyError(f"{what}词条过长: {w[:30]!r}…")
+    return w
+
+
+def gen_frequency(freq):
+    if not isinstance(freq, dict):
+        raise ApplyError("freq 必须是对象")
+    out = ["# 本文件由 TRCFG1 生成（微信/网页配置端）。手工微调会在下次 TRCFG1 应用时被覆盖。", ""]
+    gf = freq.get("global_filter") or []
+    out.append("[GLOBAL_FILTER]")
+    for w in gf:
+        out.append(_word(w, "全局过滤"))
+    out.append("")
+    groups = freq.get("groups") or []
+    if groups:
+        out.append("[WORD_GROUPS]")
+        for g in groups:
+            if not isinstance(g, dict):
+                raise ApplyError("词组必须是对象")
+            out.append("")
+            name = str(g.get("name") or "").strip()
+            if name:
+                name = _word(name, "词组名")
+                if re.search(r"[\[\]]", name):
+                    raise ApplyError(f"词组名含括号: {name!r}")
+                out.append(f"[{name}]")
+            for w in g.get("words") or []:
+                out.append(_word(w, "关键词"))
+            for w in g.get("must") or []:
+                out.append("+" + _word(w, "必须词"))
+            for w in g.get("exclude") or []:
+                out.append("!" + _word(w, "排除词"))
+            mx = g.get("max")
+            if mx is not None:
+                if not isinstance(mx, int) or not 0 < mx <= 50:
+                    raise ApplyError(f"词组 {name!r} 的 max 需为 1-50 整数")
+                out.append(f"@{mx}")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def apply_payload(payload, user_config):
+    """应用 TRCFG1 载荷 → 返回 changes 列表；任何错误抛 ApplyError（文件不动，天然全有或全无）。"""
+    if not isinstance(payload, dict):
+        raise ApplyError("载荷必须是 JSON 对象")
+    if payload.get("v") != 1:
+        raise ApplyError(f"不支持的载荷版本: {payload.get('v')!r}（本管家支持 v1）")
+    cfg = payload.get("cfg") or {}
+    freq = payload.get("freq")
+    if not cfg and freq is None:
+        raise ApplyError("载荷为空（cfg 与 freq 均缺省）")
+    if not isinstance(cfg, dict):
+        raise ApplyError("cfg 必须是对象")
+
+    config_path = user_config / "config.yaml"
+    original = config_path.read_text(encoding="utf-8")
+    lines = original.splitlines()
+    changes = []
+    staged = []
+
+    sched = cfg.get("schedule") or {}
+    if "enabled" in sched:
+        b = sched["enabled"]
+        if not isinstance(b, bool):
+            raise ApplyError("schedule.enabled 需为 true/false")
+        staged.append(lambda b=b: _patch_scalar(
+            lines, "schedule", "enabled", "true" if b else "false", changes,
+            "推送节奏 → 按模板时段推送" if b else "推送节奏 → 全天（每 30 分钟一期）"))
+    if "preset" in sched:
+        v = sched["preset"]
+        if v not in SCHEDULE_PRESETS:
+            raise ApplyError(f"schedule.preset 非法: {v!r}（可选: {sorted(SCHEDULE_PRESETS)}）")
+        staged.append(lambda v=v: _patch_scalar(lines, "schedule", "preset", f'"{v}"', changes, f"推送节奏 → {PRESET_ZH[v]}"))
+    notif = cfg.get("notification") or {}
+    if "enabled" in notif:
+        b = notif["enabled"]
+        if not isinstance(b, bool):
+            raise ApplyError("notification.enabled 需为 true/false")
+        staged.append(lambda b=b: _patch_scalar(lines, "notification", "enabled", "true" if b else "false", changes, "恢复推送" if b else "暂停推送"))
+    rep = cfg.get("report") or {}
+    if "mode" in rep:
+        v = rep["mode"]
+        if v not in REPORT_MODES:
+            raise ApplyError(f"report.mode 非法: {v!r}（可选: {sorted(REPORT_MODES)}）")
+        staged.append(lambda v=v: _patch_scalar(lines, "report", "mode", f'"{v}"', changes, f"每期内容 → {MODE_ZH[v]}"))
+    if "display_mode" in rep:
+        v = rep["display_mode"]
+        if v not in DISPLAY_MODES:
+            raise ApplyError(f"report.display_mode 非法: {v!r}（可选: {sorted(DISPLAY_MODES)}）")
+        staged.append(lambda v=v: _patch_scalar(lines, "report", "display_mode", f'"{v}"', changes, f"分组方式 → {DMODE_ZH[v]}"))
+    plat = cfg.get("platforms") or {}
+    for pid, on in (plat.get("sources") or {}).items():
+        if not isinstance(on, bool):
+            raise ApplyError(f"platforms.sources.{pid} 需为 true/false")
+        staged.append(lambda pid=pid, on=on: _toggle_platform(lines, str(pid), on, changes))
+    rss = cfg.get("rss") or {}
+    for fid, on in (rss.get("feeds") or {}).items():
+        if not isinstance(on, bool):
+            raise ApplyError(f"rss.feeds.{fid} 需为 true/false")
+        staged.append(lambda fid=fid, on=on: _toggle_feed(lines, str(fid), on, changes))
+
+    for fn in staged:
+        fn()
+
+    new_yaml = "\n".join(lines) + "\n"
+    yaml_changed = bool(staged) and new_yaml != original
+    freq_path = user_config / "frequency_words.txt"
+    orig_freq = freq_path.read_text(encoding="utf-8") if freq_path.exists() else ""
+    freq_text = gen_frequency(freq) if freq is not None else None
+    freq_changed = freq_text is not None and freq_text != orig_freq
+    if not yaml_changed and not freq_changed:
+        return changes or ["载荷与当前配置一致，无变化"]
+    if freq_changed:
+        gf_n = len(freq.get("global_filter") or [])
+        gs = freq.get("groups") or []
+        w_n = sum(len(g.get("words") or []) for g in gs)
+        changes.append(
+            f"关注词 → 已更新（{len(gs)} 个主题 {w_n} 个词 · 屏蔽 {gf_n} 词）"
+            if (gf_n or gs) else "关注词 → 已清空（恢复推送全部热榜）"
+        )
+    elif freq is not None and yaml_changed:
+        changes.append("关注词 → 与当前一致")
+
+    _backup(user_config, ["config.yaml", "frequency_words.txt"])
+    if yaml_changed:
+        config_path.write_text(new_yaml, encoding="utf-8")
+    if freq_changed:
+        freq_path.write_text(freq_text, encoding="utf-8")
+    return changes or ["已写入"]
+
+
+def toggle_push(enabled, user_config):
+    return apply_payload({"v": 1, "cfg": {"notification": {"enabled": bool(enabled)}}}, user_config)
+
+
+if __name__ == "__main__":
+    # 急救通道：微信通道失灵时的终端入口（与微信指令同一 apply 核心、同一白名单）
+    # 用法: python tr2w/apply_trcfg.py 载荷.json   （JSON 内容 = TRCFG1 冒号后的 base64url 串或原始 JSON）
+    import base64 as _b64
+    import json as _json
+    import sys as _sys
+
+    if len(_sys.argv) != 2:
+        print("用法: python apply_trcfg.py 载荷文件.json（或 TRCFG1 码文件，内容一行）")
+        raise SystemExit(2)
+    raw = Path(_sys.argv[1]).read_text(encoding="utf-8").strip()
+    if raw.startswith("TRCFG1:"):
+        raw = raw[len("TRCFG1:"):].strip()
+        raw = _b64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+    try:
+        for c in apply_payload(_json.loads(raw), USER_CONFIG):
+            print("·", c)
+        print("已应用。立即验证: systemctl start trendradar-fetch")
+    except ApplyError as e:
+        print(f"❌ 配置未应用（文件未动）: {e}")
+        raise SystemExit(1)
+
+
+def _parse_words(fp):
+    """解析 frequency_words.txt → (总词数, 组数, 展示用概览文本)。只读。"""
+    try:
+        lines = fp.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return 0, 0, "未配置关键词（推送全部热榜）"
+    in_groups = False
+    n = 0
+    groups = 0
+    preview = []
+    cur_group = None
+    for ln in lines:
+        s = ln.strip()
+        if s == "[WORD_GROUPS]":
+            in_groups = True
+            continue
+        if s == "[GLOBAL_FILTER]":
+            in_groups = False
+            continue
+        if not in_groups or not s or s.startswith("#"):
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            groups += 1
+            cur_group = s[1:-1]
+            continue
+        if s.startswith(("!", "+", "@")):
+            continue
+        n += 1
+        if len(preview) < 40:
+            preview.append(f"· {s}" + (f"（{cur_group}）" if cur_group else ""))
+    return n, groups, "\n".join(preview)
+
+
+def config_summary(user_config):
+    import yaml
+
+    cfg = yaml.safe_load((user_config / "config.yaml").read_text(encoding="utf-8")) or {}
+    plat = cfg.get("platforms") or {}
+    srcs = plat.get("sources") or []
+    feeds = (cfg.get("rss") or {}).get("feeds") or []
+    n_feed_on = sum(1 for f in feeds if f.get("enabled", True))
+    rep = cfg.get("report") or {}
+    sched = cfg.get("schedule") or {}
+    notif = cfg.get("notification") or {}
+    n, g, _ = _parse_words(user_config / "frequency_words.txt")
+    push_state = "推送中 ✅" if notif.get("enabled", True) else "已暂停 ⏸"
+    return (
+        f"📊 当前状态\n· 推送: {push_state}\n· 节奏: {sched.get('preset', '-')}\n"
+        f"· 形态: {rep.get('mode', '-')} / {rep.get('display_mode', '-')}\n"
+        f"· 平台: {len(srcs)} 个｜RSS: {n_feed_on}/{len(feeds)} 个\n· 关键词: {n} 词 / {g} 组"
+    )
+
+
+def words_overview(user_config):
+    n, g, preview = _parse_words(user_config / "frequency_words.txt")
+    if n == 0:
+        return "🔖 词表: 未配置关键词（推送全部热榜）"
+    return f"🔖 词表: {n} 词 / {g} 组\n{preview}"
+PY_APPLY
+
+  cat > "$DEST/tr2w/tr2w_handler.py" <<'PY_HANDLER'
+#!/usr/bin/env python3
+"""tr2w 管家 —— 消费 any2wechat 入站转发，微信对话式管理 TrendRadar。
+
+安全铁律（D14）：只认扫码者本人（双层校验：桥 P-35 守卫 + 本地 owner 比对）；
+只做白名单动作；TRCFG1 载荷只是数据，永不执行其中任何字符串。
+回复走既有桥 /webhook（同机回环），桥零额外接口。
+"""
+import base64
+import binascii
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+import apply_trcfg  # noqa: E402
+
+DEST = Path(os.environ.get("TR2W_DEST", "/opt/TrendRadar"))
+USER_CONFIG = DEST / "user-config"
+CREDS_FILE = Path(os.environ.get("TR2W_CREDS", str(DEST / "any2wechat-data" / "credentials.json")))
+RELAY_TOKEN = os.environ.get("TR2W_RELAY_TOKEN", "")
+BRIDGE_URL = os.environ.get("TR2W_BRIDGE_URL", "http://127.0.0.1:8788/webhook")
+FETCH_UNIT = "trendradar-fetch"
+
+MENU = (
+    "📖 指令菜单（tr2w 管家）\n"
+    "· 帮助 —— 本菜单\n"
+    "· 状态 —— 当前配置速览\n"
+    "· 词表 —— 查看关注关键词\n"
+    "· 暂停 / 恢复 —— 停止/恢复推送\n"
+    "· 立即推送 —— 马上抓取并推一期\n"
+    "· TRCFG1:… —— 粘贴配置码（博客可视化页生成），立即生效"
+)
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def owner_id():
+    try:
+        return json.loads(CREDS_FILE.read_text(encoding="utf-8")).get("user_id", "")
+    except Exception as err:
+        log(f"[handler] 读取凭证失败: {err}")
+        return ""
+
+
+def reply(text):
+    req = urllib.request.Request(
+        BRIDGE_URL,
+        data=json.dumps({"content": text}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        body = r.read().decode("utf-8", "replace")
+    if r.status != 202:
+        raise RuntimeError(f"bridge HTTP {r.status}: {body[:120]}")
+
+
+def handle_payload(rest):
+    rest = rest.strip()
+    try:
+        raw = base64.urlsafe_b64decode(rest + "=" * (-len(rest) % 4))
+        payload = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as err:
+        return f"❌ 配置码解码失败: {err}"
+    try:
+        changes = apply_trcfg.apply_payload(payload, USER_CONFIG)
+    except apply_trcfg.ApplyError as err:
+        return f"❌ 配置未应用（文件未动）: {err}"
+    except Exception as err:  # 兜底：任何异常都不落半态（apply 内部已保证不写盘）
+        return f"❌ 配置未应用（文件未动）: {err.__class__.__name__}: {err}"
+    subprocess.Popen(["systemctl", "start", FETCH_UNIT])
+    body = "✅ 配置已应用：\n" + "\n".join(f"· {c}" for c in changes)
+    return body + "\n⏳ 已触发立即抓取，约 1 分钟后收到新样式推送"
+
+
+def dispatch(text):
+    if text.startswith("TRCFG1:"):
+        return handle_payload(text[len("TRCFG1:"):])
+    t = text.strip().lower()
+    if t in ("帮助", "菜单", "help", "h", "?", "？"):
+        return MENU
+    if t == "状态":
+        return apply_trcfg.config_summary(USER_CONFIG)
+    if t == "词表":
+        return apply_trcfg.words_overview(USER_CONFIG)
+    if t == "暂停":
+        changes = apply_trcfg.toggle_push(False, USER_CONFIG)
+        return "⏸ 推送已暂停（抓取照常，发「恢复」继续）"
+    if t == "恢复":
+        changes = apply_trcfg.toggle_push(True, USER_CONFIG)
+        return "▶️ 推送已恢复"
+    if t == "立即推送":
+        subprocess.Popen(["systemctl", "start", FETCH_UNIT])
+        return "⏳ 已触发抓取，约 1 分钟后送达"
+    if text.startswith("TRCFG1"):
+        return "❌ 配置码格式: 以 TRCFG1: 开头（博客可视化页一键生成）"
+    return "没听懂这条指令 🤔 发「帮助」查看我能做什么"
+
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        if self.path != "/inbound":
+            self.send_response(404)
+            self.end_headers()
+            return
+        if RELAY_TOKEN:
+            auth = (self.headers.get("Authorization") or "").replace("Bearer ", "")
+            if auth != RELAY_TOKEN:
+                log("[handler] 401 token mismatch")
+                self.send_response(401)
+                self.end_headers()
+                return
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n)
+        try:
+            j = json.loads(body.decode("utf-8"))
+        except Exception:
+            self.send_response(400)
+            self.end_headers()
+            return
+        frm = j.get("from_user_id", "")
+        text = str(j.get("text") or "").strip()
+        owner = owner_id()
+        if owner and frm != owner:
+            log(f"[handler] 403 非扫码者消息已忽略 from={frm[:20]}")
+            self.send_response(403)
+            self.end_headers()
+            return
+        log(f"[handler] 收到指令 len={len(text)} head={text[:20]!r}")
+        try:
+            out = dispatch(text)
+        except Exception as err:
+            log(f"[handler] 处理异常: {err}")
+            out = f"❌ 处理失败: {err.__class__.__name__}: {err}"
+        try:
+            reply(out)
+            log(f"[handler] 已回复 ({len(out)} 字符)")
+        except Exception as err:
+            log(f"[handler] 回复失败（桥未就绪？）: {err}")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
+
+    def log_message(self, *a):
+        pass
+
+
+if __name__ == "__main__":
+    log("=== tr2w 管家 ===")
+    log(f"配置目录: {USER_CONFIG}｜桥: {BRIDGE_URL}｜鉴权: {'开' if RELAY_TOKEN else '关'}")
+    ThreadingHTTPServer(("127.0.0.1", int(os.environ.get("TR2W_PORT", "8899"))), H).serve_forever()
+PY_HANDLER
+
+  if ! "$DEST/.venv/bin/python" -m py_compile "$DEST/tr2w/apply_trcfg.py" "$DEST/tr2w/tr2w_handler.py" 2>/dev/null; then
+    warn "管家脚本语法校验失败，跳过部署（不影响 TrendRadar 与推送本体）"
+  else
+    cat > /etc/systemd/system/tr2w-handler.service <<EOF
+[Unit]
+Description=tr2w WeChat config handler (any2wechat relay consumer)
+After=network.target any2wechat.service
+
+[Service]
+WorkingDirectory=$DEST/tr2w
+EnvironmentFile=$ENV_FILE
+Environment=TR2W_DEST=$DEST
+Environment=TR2W_BRIDGE_URL=http://127.0.0.1:$A2W_PORT/webhook
+Environment=TR2W_PORT=$TR2W_PORT
+ExecStart=$DEST/.venv/bin/python $DEST/tr2w/tr2w_handler.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now tr2w-handler >/dev/null 2>&1
+    sleep 2
+    if curl -sm2 "http://127.0.0.1:$TR2W_PORT/health" 2>/dev/null | grep -q '"ok":true'; then
+      ok "管家已上线（微信里给 bot 发『帮助』查看指令菜单）"
+    else
+      warn "管家未就绪（不影响推送本体；查看: journalctl -u tr2w-handler -n 20）"
     fi
   fi
 fi
@@ -613,7 +1216,8 @@ if [ "$WECHAT_BRIDGE" = "1" ] && [ "$BRIDGE_OK" = "1" ]; then
       echo "         cd $A2W_SRC && BRIDGE_DATA_DIR=$A2W_DATA node bin/login.mjs"
       echo "         授权成功后，在微信里给 bot 发任意一条消息（如「绑定」）即完成绑定"
     fi
-  echo "       ▶ 桥日志: journalctl -u any2wechat -f"
+      echo "       ▶ 桥日志: journalctl -u any2wechat -f"
+      echo "       💬 微信指令: 给 bot 发『帮助』查看菜单（改配置/暂停/恢复/词表/状态）"
 elif [ -n "$CHANNELS" ]; then
   echo "    📱 已配置推送:$CHANNELS"
 else
@@ -621,7 +1225,7 @@ else
   echo "       bash install-trendradar.sh --wechat-bridge --no-web"
   echo "       （也支持 --wework / --feishu / --dingtalk / --telegram 'BotToken:ChatID'）"
 fi
-echo "    📖 配置指南（关键词/推送节奏/信息源）: github.com/geekkkk404/trendradar2wechat/blob/main/docs/config-guide.md"
+echo "    📖 可视化配置: geekkkk.com/trcfg （生成配置码发微信即生效）｜进阶: docs/config-guide.md"
 echo "    🔧 查看抓取日志: journalctl -u trendradar-fetch -n 50   （跟踪 -f）"
 echo "    ⏰ 定时任务:     systemctl list-timers trendradar-fetch*"
 echo "    🔄 升级更新:     重跑本脚本即可（幂等，保留配置与数据；含 --wechat-bridge 时桥同步更新）"

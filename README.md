@@ -18,6 +18,9 @@ curl -fsSL --retry 3 https://geekkkk.com/trendradar.sh -o install.sh && bash ins
 - `--no-web`：不开放任何入站端口（最安全形态；热点推送不依赖网页）
 - 全部选项：`bash install.sh --help`
 
+部署后，微信里给 bot 发「帮助」即可对话式管理（暂停/恢复/改配置）；个性化配置推荐用
+可视化配置页 **[geekkkk.com/trcfg](https://geekkkk.com/trcfg/)** 勾选生成配置码，粘贴给 bot 即生效。
+
 要求：Ubuntu 20.04+ / Debian 11+（x86_64 / arm64），1GB 内存起，**无需 Docker**
 （Python ≥3.12 由脚本自动准备，Ubuntu 24.04 自带）。
 TrendRadar 与推送桥由脚本在安装时从各自官方仓库获取并原生部署，本仓库只分发安装脚本与文档。
