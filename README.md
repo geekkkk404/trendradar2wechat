@@ -8,7 +8,7 @@
 
 ## 快速开始
 
-在 SSH / 腾讯云 OrcaTerm 终端中执行（跟着提示扫码授权、微信里发一句「绑定」即可）：
+在 SSH / 腾讯云 OrcaTerm 终端中执行（跟着提示扫码授权、微信里给 bot 发任意一条消息完成绑定即可）：
 
 ```bash
 curl -fsSL --retry 3 https://geekkkk.com/trendradar.sh -o install.sh && bash install.sh --wechat-bridge --no-web
@@ -21,6 +21,11 @@ curl -fsSL --retry 3 https://geekkkk.com/trendradar.sh -o install.sh && bash ins
 要求：Ubuntu 20.04+ / Debian 11+（x86_64 / arm64），1GB 内存起，**无需 Docker**
 （Python ≥3.12 由脚本自动准备，Ubuntu 24.04 自带）。
 TrendRadar 与推送桥由脚本在安装时从各自官方仓库获取并原生部署，本仓库只分发安装脚本与文档。
+
+## 配置与自定义
+
+部署后的个性化（关注关键词、推送节奏、信息源取舍）见 **[配置指南](docs/config-guide.md)**。
+读者配置外置于安装目录 `user-config/`（与上游源码隔离），升级 / 重跑安装脚本**永不覆盖**。
 
 ## 免责声明
 

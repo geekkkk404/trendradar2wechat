@@ -43,6 +43,7 @@
 #    - systemd 管三件事: 网页报告（trendradar-web）、定时抓取（trendradar-fetch.timer
 #      每 30 分钟）、可选 MCP（trendradar-mcp）；日志统一 journalctl
 #    - 推送渠道配置保存在 {安装目录}/trendradar.env，可随时手工编辑，下次抓取生效
+#    - 读者个性化配置（关键词/主配置）外置于 {安装目录}/user-config/，升级重跑永不覆盖
 #    - --wechat-bridge：Node 原生运行 any2wechat（零 npm 依赖），个人微信直推，
 #      桥故障不影响 TrendRadar 本体
 # =============================================================================
@@ -249,18 +250,31 @@ ok "uv $(uv --version | awk '{print $2}')（PyPI 源: $PYPI_INDEX）"
 # ----------------------------- 获取源码 ---------------------------------------
 step "获取 TrendRadar 源码 → $DEST"
 if [ -d "$DEST/.git" ]; then
-  git -C "$DEST" fetch --depth 1 origin "$REPO_BRANCH" >/dev/null 2>&1 \
-    && git -C "$DEST" reset --hard "origin/$REPO_BRANCH" >/dev/null 2>&1 \
-    && ok "已更新到最新版"
+  # 升级路径：直连 30s 不通即切代理链（与全新克隆同一纪律）；全灭则优雅降级用现有版本
+  UPD_GOT=0
+  if timeout 30 git -C "$DEST" fetch --depth 1 origin "$REPO_BRANCH" >/dev/null 2>&1; then
+    UPD_GOT=1
+  else
+    for prefix in "${GH_PROXY_FALLBACKS[@]}"; do
+      if timeout 45 git -C "$DEST" fetch --depth 1 "${prefix}/$REPO_URL.git" "$REPO_BRANCH" >/dev/null 2>&1; then UPD_GOT=1; break; fi
+    done
+  fi
+  if [ "$UPD_GOT" = "1" ]; then
+    git -C "$DEST" reset --hard FETCH_HEAD >/dev/null 2>&1 && ok "已更新到最新版"
+  else
+    warn "源码更新未成功（网络问题），继续使用现有版本（配置与数据不受影响）"
+  fi
 elif [ -e "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
   die "目录 $DEST 已存在且非本脚本安装，请更换 --dir 或先清理"
 else
   GOT=0
-  # 直连 15s 不通即切代理（社区代理单源 15s；连接不上的源等再久也连不上）
+  # 超时解耦（家宽实测：直连 15.4s / ghfast 19s 可完成 28MB，15s 一刀切会杀死正在工作的慢传输）：
+  # 直连 15s 只管「连不上秒败」的连接纪律；代理源给 45s 传输预算（CDN 承载，瓶颈在吞吐）
   for prefix in "" "${GH_PROXY_FALLBACKS[@]}"; do
     url="${prefix:+$prefix/}$REPO_URL.git"
     echo "  克隆: $url"
-    if timeout 15 git clone --depth 1 -b "$REPO_BRANCH" "$url" "$DEST" >/dev/null 2>&1; then GOT=1; break; fi
+    if [ -z "$prefix" ]; then TMO=15; else TMO=45; fi
+    if timeout "$TMO" git clone --depth 1 -b "$REPO_BRANCH" "$url" "$DEST" >/dev/null 2>&1; then GOT=1; break; fi
     rm -rf "$DEST"
   done
   [ "$GOT" = "1" ] || die "源码克隆失败（网络问题），请重跑本脚本重试"
@@ -279,13 +293,38 @@ else
 fi
 
 # ----------------------------- 配置写入 ---------------------------------------
-step "写入配置（trendradar.env）"
+step "写入配置（trendradar.env + 用户配置外置）"
 ENV_FILE="$DEST/trendradar.env"
 touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
 # systemd EnvironmentFile 与 bash source 双消费方：值一律单引号包裹（内嵌 JSON 安全）
 upsert_env() { sed -i "/^$1=/d" "$ENV_FILE"; printf "%s='%s'\n" "$1" "$(printf '%s' "$2" | sed "s/'/'\\\\''/g")" >> "$ENV_FILE"; }
-upsert_env "CONFIG_PATH" "$DEST/config/config.yaml"
-upsert_env "FREQUENCY_WORDS_PATH" "$DEST/config/frequency_words.txt"
+
+# 读者个性化配置外置（P-32）：user-config 是脚本自有目录、git 不跟踪——升级时的
+# git reset --hard 永远碰不到它。首次安装从上游模板播种，此后存在即不覆盖。
+# 上游消费链已核实：CONFIG_PATH（core/loader.py）与 FREQUENCY_WORDS_PATH（core/frequency.py）
+# 两个环境变量均为上游官方入口，指向外部目录不修改上游任何源码。
+USER_CONFIG="$DEST/user-config"
+mkdir -p "$USER_CONFIG"
+if [ -f "$USER_CONFIG/config.yaml" ]; then
+  ok "用户配置已存在，升级不覆盖（$USER_CONFIG）"
+else
+  [ -f "$DEST/config/config.yaml" ] || die "上游模板缺失（源码 clone 不完整），请重跑本脚本"
+  # 整目录播种（保持上游 config/ 目录形制）：上游按「与 config.yaml 同目录」解析伴生文件
+  # （实测 timeline.yaml 未随迁 → 空模板 + preset 报错），AI 提示词等邻座文件一并外置
+  cp -r "$DEST/config/." "$USER_CONFIG/"
+  cat > "$USER_CONFIG/README.txt" <<'MDEOF'
+此目录存放你的个性化配置；重跑安装脚本升级时【不会被覆盖】。
+
+  frequency_words.txt   关注关键词（追什么词、排除什么词）
+  config.yaml           主配置（推送节奏/信息源/报告形态等，文件内含中文注释）
+
+修改后在下次定时抓取（每 30 分钟）自动生效；
+想立即验证请在终端执行: systemctl start trendradar-fetch
+MDEOF
+  ok "用户配置已初始化（$USER_CONFIG，升级不覆盖）"
+fi
+upsert_env "CONFIG_PATH" "$USER_CONFIG/config.yaml"
+upsert_env "FREQUENCY_WORDS_PATH" "$USER_CONFIG/frequency_words.txt"
 upsert_env "PYTHONUNBUFFERED" "1"
 upsert_env "WEBSERVER_PORT" "$PORT"
 [ -n "$WEWORK" ]   && upsert_env "WEWORK_WEBHOOK_URL"   "$WEWORK"
@@ -565,15 +604,15 @@ else
 fi
 if [ "$WECHAT_BRIDGE" = "1" ] && [ "$BRIDGE_OK" = "1" ]; then
   echo "    📱 微信推送: any2wechat 桥已部署（TrendRadar 通用 webhook 已指向桥）"
-  if [ "$BRIDGE_AUTHED" = "1" ]; then
-    echo "       ▶ 最后一步: 在微信里给 bot 发一句「绑定」"
-    echo "         bot 会话可在微信通讯录里找到（授权时创建）；绑定确认后热点日报直达微信"
-    echo "         想立刻收第一期: systemctl start trendradar-fetch"
-  else
-    echo "       ▶ 微信授权尚未完成，在服务器终端补做（复制整段执行）:"
-    echo "         cd $A2W_SRC && BRIDGE_DATA_DIR=$A2W_DATA node bin/login.mjs"
-    echo "         授权成功后，在微信里给 bot 发一句「绑定」即完成绑定"
-  fi
+    if [ "$BRIDGE_AUTHED" = "1" ]; then
+      echo "       ▶ 最后一步: 在微信里给 bot 发任意一条消息（如「绑定」）即完成绑定"
+      echo "         bot 会话可在微信通讯录里找到（授权时创建）；收到「✅ 绑定成功」回执后，热点日报直达微信"
+      echo "         想立刻收第一期: systemctl start trendradar-fetch"
+    else
+      echo "       ▶ 微信授权尚未完成，在服务器终端补做（复制整段执行）:"
+      echo "         cd $A2W_SRC && BRIDGE_DATA_DIR=$A2W_DATA node bin/login.mjs"
+      echo "         授权成功后，在微信里给 bot 发任意一条消息（如「绑定」）即完成绑定"
+    fi
   echo "       ▶ 桥日志: journalctl -u any2wechat -f"
 elif [ -n "$CHANNELS" ]; then
   echo "    📱 已配置推送:$CHANNELS"
@@ -582,6 +621,7 @@ else
   echo "       bash install-trendradar.sh --wechat-bridge --no-web"
   echo "       （也支持 --wework / --feishu / --dingtalk / --telegram 'BotToken:ChatID'）"
 fi
+echo "    📖 配置指南（关键词/推送节奏/信息源）: github.com/geekkkk404/trendradar2wechat/blob/main/docs/config-guide.md"
 echo "    🔧 查看抓取日志: journalctl -u trendradar-fetch -n 50   （跟踪 -f）"
 echo "    ⏰ 定时任务:     systemctl list-timers trendradar-fetch*"
 echo "    🔄 升级更新:     重跑本脚本即可（幂等，保留配置与数据；含 --wechat-bridge 时桥同步更新）"
