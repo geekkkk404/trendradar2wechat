@@ -210,11 +210,12 @@ if [ "$PY_GE_312" = "1" ]; then
   export UV_PYTHON_PREFERENCE=only-system
   ok "系统 Python $(python3 --version | awk '{print $2}')（满足 ≥3.12，直接使用）"
 else
-  # 系统 Python 过低 → 让 uv 自动下载自带 Python（境内经代理加速）
-  if [ "$REGION" != "overseas" ]; then
-    export UV_PYTHON_INSTALL_MIRROR="$UV_PY_MIRROR_PROXY"
-  fi
-  warn "系统 Python 低于 3.12，将由 uv 自动安装独立 Python（一次性，约 30-60 秒）"
+  # 系统 Python 过低 → uv 代装解释器，钉 3.12（与 24.04 系统路径同版本，避免读者间运行时漂移；
+  # 不钉则 uv 拿最新 3.15.x，两路读者运行时不一致）。此处只设环境变量，实际安装
+  # 在 uv 本体就绪之后进行（首版曾把安装放本分支 → purge 后 uv 缺位致镜像链假死，实测踩中）
+  export UV_PYTHON="3.12"
+  PY_NEED_INSTALL=1
+  warn "系统 Python $(python3 --version | awk '{print $2}') 低于 3.12，将安装独立 Python 3.12（一次性）"
 fi
 
 if ! command -v uv >/dev/null 2>&1; then
@@ -248,6 +249,35 @@ fi
 command -v uv >/dev/null 2>&1 || die "uv 仍不可用，请重跑或手动安装: pip3 install uv"
 ok "uv $(uv --version | awk '{print $2}')（PyPI 源: $PYPI_INDEX）"
 
+# uv 本体就绪后再装解释器（镜像链依赖 uv；系统已满足 ≥3.12 时跳过）
+if [ "${PY_NEED_INSTALL:-0}" = "1" ]; then
+  PY_OK=0
+  if [ "$REGION" != "overseas" ]; then
+    # 镜像链逐候选试装（2026-11-05 站主重装 22.04 实测暴露：ghfast 对 release 资产 403、ghp.ci 已死；
+    # npmmirror=阿里 CDN 实装 3.12.16 仅 2.77s 最稳 → 链首；gh-proxy 200 可用次选；ghfast 降为保底）。
+    # uv 只接受单值镜像 → 脚本级链；uv python install 幂等，已装秒回
+    for M in "https://registry.npmmirror.com/-/binary/python-build-standalone" \
+             "https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download" \
+             "$UV_PY_MIRROR_PROXY"; do
+      export UV_PYTHON_INSTALL_MIRROR="$M"
+      echo "  安装 Python 3.12（镜像: $(echo "$M" | awk -F/ '{print $3}')）"
+      if uv python install 3.12 >/tmp/tr-uvmirror.log 2>&1; then PY_OK=1; break; fi
+      # 装报失败但解释器其实已在（半装态）→ 复验兜底
+      uv python list --only-installed 2>/dev/null | grep -q "3.12" && { PY_OK=1; break; }
+    done
+  else
+    unset UV_PYTHON_INSTALL_MIRROR
+    echo "  安装 Python 3.12（官方源）..."
+    uv python install 3.12 >/tmp/tr-uvmirror.log 2>&1 && PY_OK=1
+  fi
+  if [ "$PY_OK" = "1" ]; then
+    ok "独立 Python 3.12 已就绪"
+  else
+    tail -5 /tmp/tr-uvmirror.log 2>/dev/null
+    die "Python 3.12 安装失败（镜像链全灭），请重跑本脚本重试"
+  fi
+fi
+
 # ----------------------------- 获取源码 ---------------------------------------
 step "获取 TrendRadar 源码 → $DEST"
 if [ -d "$DEST/.git" ]; then
@@ -268,15 +298,23 @@ if [ -d "$DEST/.git" ]; then
 elif [ -e "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
   die "目录 $DEST 已存在且非本脚本安装，请更换 --dir 或先清理"
 else
+  # 整链重试（P-28 硬化补回：原 Docker 脚本有、路线③重写时遗失）——抖动期一轮全灭常见，等 30s 二轮常活
   GOT=0
-  # 超时解耦（家宽实测：直连 15.4s / ghfast 19s 可完成 28MB，15s 一刀切会杀死正在工作的慢传输）：
-  # 直连 15s 只管「连不上秒败」的连接纪律；代理源给 45s 传输预算（CDN 承载，瓶颈在吞吐）
-  for prefix in "" "${GH_PROXY_FALLBACKS[@]}"; do
-    url="${prefix:+$prefix/}$REPO_URL.git"
-    echo "  克隆: $url"
-    if [ -z "$prefix" ]; then TMO=15; else TMO=45; fi
-    if timeout "$TMO" git clone --depth 1 -b "$REPO_BRANCH" "$url" "$DEST" >/dev/null 2>&1; then GOT=1; break; fi
-    rm -rf "$DEST"
+  for PASS in 1 2; do
+    if [ "$PASS" = "2" ]; then
+      echo "  第一轮克隆链全灭，等 30s 整链重试一轮…"
+      sleep 30
+    fi
+    # 超时解耦（家宽实测：直连 15.4s / ghfast 19s 可完成 28MB，15s 一刀切会杀死正在工作的慢传输）：
+    # 直连 15s 只管「连不上秒败」的连接纪律；代理源给 45s 传输预算（CDN 承载，瓶颈在吞吐）
+    for prefix in "" "${GH_PROXY_FALLBACKS[@]}"; do
+      url="${prefix:+$prefix/}$REPO_URL.git"
+      echo "  克隆: $url"
+      if [ -z "$prefix" ]; then TMO=15; else TMO=45; fi
+      if timeout "$TMO" git clone --depth 1 -b "$REPO_BRANCH" "$url" "$DEST" >/dev/null 2>&1; then GOT=1; break; fi
+      rm -rf "$DEST"
+    done
+    [ "$GOT" = "1" ] && break
   done
   [ "$GOT" = "1" ] || die "源码克隆失败（网络问题），请重跑本脚本重试"
   ok "克隆完成"
