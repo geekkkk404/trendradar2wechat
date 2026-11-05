@@ -324,6 +324,15 @@ else
 MDEOF
   ok "用户配置已初始化（$USER_CONFIG，升级不覆盖）"
 fi
+# AI 分析默认关闭（P-44）：上游两级开关默认全开——ai.enabled 总开关 + regions.ai_analysis
+# 显示开关。无 AI Key 的读者每期推送都带「⚠️ AI 分析失败」且每轮白跑一次 AI 调用。
+# 未配置 Key 时一律收敛为 false（按行内唯一中文注释精确定位，避免误伤其他 enabled）；
+# 读者已配 Key 则不动其开关。
+if [ -z "$AI_KEY" ] && ! grep -q '^AI_API_KEY=' "$ENV_FILE" 2>/dev/null; then
+  sed -i '/是否启用 AI 分析（true=启用/s/^\( *enabled: \)true/\1false/' "$USER_CONFIG/config.yaml"
+  sed -i 's/^\( *ai_analysis: \)true/\1false/' "$USER_CONFIG/config.yaml"
+  ok "AI 分析已默认关闭（未配置 AI Key；想开请先配置 Key，见 docs/config-guide.md）"
+fi
 upsert_env "CONFIG_PATH" "$USER_CONFIG/config.yaml"
 upsert_env "FREQUENCY_WORDS_PATH" "$USER_CONFIG/frequency_words.txt"
 upsert_env "PYTHONUNBUFFERED" "1"
@@ -542,6 +551,8 @@ Environment=BRIDGE_HOST=127.0.0.1
 Environment=BRIDGE_PORT=$A2W_PORT
 Environment=BRIDGE_RELAY_URL=http://127.0.0.1:$TR2W_PORT/inbound
 Environment=BRIDGE_RELAY_TOKEN=$TR2W_RELAY_TOKEN
+Environment="BRIDGE_FOOTER_TEXT=📖 微信改配置：geekkkk.com/trcfg ｜ 发「帮助」看指令"
+Environment="BRIDGE_FOOTER_ONCE_PER_DAY=1"
 Restart=always
 RestartSec=30
 
@@ -863,10 +874,29 @@ def apply_payload(payload, user_config):
         gf_n = len(freq.get("global_filter") or [])
         gs = freq.get("groups") or []
         w_n = sum(len(g.get("words") or []) for g in gs)
-        changes.append(
+        head = (
             f"关注词 → 已更新（{len(gs)} 个主题 {w_n} 个词 · 屏蔽 {gf_n} 词）"
             if (gf_n or gs) else "关注词 → 已清空（恢复推送全部热榜）"
         )
+        # 实名小票（P-45）：像点餐小票列出「你设置了什么」，而非只报计数；
+        # 组数/词数超阈值折叠回计数（控微信阅读性）
+        rows = []
+        if gs and len(gs) <= 8 and w_n <= 30:
+            for g in gs:
+                nm = str(g.get("name") or "").strip() or "未命名主题"
+                ws = [str(w) for w in (g.get("words") or [])]
+                extra = []
+                if g.get("must"):
+                    extra.append("必须:" + "、".join(map(str, g["must"])))
+                if g.get("exclude"):
+                    extra.append("排除:" + "、".join(map(str, g["exclude"])))
+                if g.get("max"):
+                    extra.append(f"每轮≤{g['max']}条")
+                tail = f"（{'；'.join(extra)}）" if extra else ""
+                rows.append(f"　· {nm}：{'、'.join(ws)}{tail}" if ws else f"　· {nm}{tail}")
+        if gf_n and gf_n <= 10:
+            rows.append("　· 屏蔽：" + "、".join(str(w) for w in freq["global_filter"]))
+        changes.append(head + (("\n" + "\n".join(rows)) if rows else ""))
     elif freq is not None and yaml_changed:
         changes.append("关注词 → 与当前一致")
 
@@ -972,6 +1002,107 @@ def words_overview(user_config):
     if n == 0:
         return "🔖 词表: 未配置关键词（推送全部热榜）"
     return f"🔖 词表: {n} 词 / {g} 组\n{preview}"
+
+
+def parse_words_structured(fp):
+    """frequency_words.txt → {"global_filter": [...], "groups": [...]}（gen_frequency 的反向，
+    round-trip 恒等）。只读；分区外的裸词条上游本就不解析（惰性内容），此处同样忽略。"""
+    out = {"global_filter": [], "groups": []}
+    cur = None
+    zone = None
+    try:
+        lines = fp.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return out
+    for ln in lines:
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s == "[GLOBAL_FILTER]":
+            zone, cur = "gf", None
+            continue
+        if s == "[WORD_GROUPS]":
+            zone = "groups"
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            cur = {"name": s[1:-1], "words": []}
+            out["groups"].append(cur)
+            zone = "groups"
+            continue
+        if zone == "gf":
+            out["global_filter"].append(s)
+        elif zone == "groups":
+            if cur is None:
+                cur = {"words": []}
+                out["groups"].append(cur)
+            if s.startswith("+"):
+                cur.setdefault("must", []).append(s[1:])
+            elif s.startswith("!"):
+                cur.setdefault("exclude", []).append(s[1:])
+            elif s.startswith("@"):
+                try:
+                    cur["max"] = int(s[1:])
+                except ValueError:
+                    pass
+            else:
+                cur["words"].append(s)
+    return out
+
+
+def export_payload(user_config):
+    """读服务端当前配置 → 反向生成 TRCFG1 v1 载荷（P-47「导出配置」）。
+    与博客页 diff 约定对齐：freq 词表全量（空词表省略=页面留空=不动词表）；
+    schedule 恒含（页面是单选态，无 diff 语义）；report 仅非页面默认值（current/keyword 不发）；
+    platforms 仅停用项（注释态条目 yaml.safe_load 看不到，扫原文）；rss 全部显式布尔
+    （页面默认可能与上游种子不一致，显式即保真）。只读，不写盘。"""
+    import yaml
+    p = {"v": 1}
+    freq = parse_words_structured(user_config / "frequency_words.txt")
+    if freq.get("global_filter") or freq.get("groups"):
+        p["freq"] = freq
+    cfg = yaml.safe_load((user_config / "config.yaml").read_text(encoding="utf-8")) or {}
+    out = {}
+    sched = cfg.get("schedule") or {}
+    if sched.get("enabled", False):
+        out["schedule"] = {"enabled": True, "preset": sched.get("preset", "always_on")}
+    else:
+        out["schedule"] = {"enabled": False}
+    rep = cfg.get("report") or {}
+    rep_out = {}
+    if rep.get("mode") and rep["mode"] != "current":
+        rep_out["mode"] = rep["mode"]
+    if rep.get("display_mode") and rep["display_mode"] != "keyword":
+        rep_out["display_mode"] = rep["display_mode"]
+    if rep_out:
+        out["report"] = rep_out
+    plat_out = {}
+    top = None
+    in_sources = False
+    for ln in (user_config / "config.yaml").read_text(encoding="utf-8").splitlines():
+        m = _SECTION.match(ln)
+        if m:
+            top = m.group(1)
+            in_sources = False
+            continue
+        if top == "platforms" and re.match(r"^  [A-Za-z_]+:", ln):
+            in_sources = ln.lstrip().startswith("sources")
+            continue
+        if top == "platforms" and in_sources:
+            m2 = _ENTRY_C.match(ln)
+            if m2:
+                plat_out[m2.group(2)] = False
+    if plat_out:
+        out["platforms"] = {"sources": plat_out}
+    rss_out = {}
+    for f in (cfg.get("rss") or {}).get("feeds") or []:
+        fid = str(f.get("id", "")).strip()
+        if fid:
+            rss_out[fid] = bool(f.get("enabled", True))
+    if rss_out:
+        out["rss"] = {"feeds": rss_out}
+    if out:
+        p["cfg"] = out
+    return p
 PY_APPLY
 
   cat > "$DEST/tr2w/tr2w_handler.py" <<'PY_HANDLER'
@@ -1009,7 +1140,9 @@ MENU = (
     "· 词表 —— 查看关注关键词\n"
     "· 暂停 / 恢复 —— 停止/恢复推送\n"
     "· 立即推送 —— 马上抓取并推一期\n"
-    "· TRCFG1:… —— 粘贴配置码（博客可视化页生成），立即生效"
+    "· 导出配置 —— 生成链接，打开即载入当前配置（改完发回）\n"
+    "· TRCFG1:… —— 粘贴配置码（博客可视化页生成），立即生效\n"
+    "🌐 配置页: geekkkk.com/trcfg"
 )
 
 
@@ -1125,6 +1258,21 @@ def trigger_fetch(preview=False):
     return "⏳ 已触发立即抓取（按当前推送形态排程推送）"
 
 
+def export_link():
+    """「导出配置」→ 带配置态的 trcfg 链接（P-47）：打开页面即载入当前全部配置，
+    改完生成新配置码发回即生效。链接只经微信消息传递，不经任何第三方存储。"""
+    try:
+        p = apply_trcfg.export_payload(USER_CONFIG)
+    except Exception as err:
+        return f"❌ 导出失败: {err.__class__.__name__}: {err}"
+    if not (p.get("freq") or p.get("cfg")):
+        return "📭 当前是默认配置，无需导出（打开 geekkkk.com/trcfg 从头勾选即可）"
+    code = base64.urlsafe_b64encode(
+        json.dumps(p, ensure_ascii=False).encode("utf-8")).decode().rstrip("=")
+    return ("📋 打开链接即载入你的当前配置（改完点生成 → 微信发回即可）：\n"
+            f"https://geekkkk.com/trcfg#c={code}")
+
+
 def handle_payload(rest):
     rest = rest.strip()
     try:
@@ -1152,6 +1300,8 @@ def dispatch(text):
         return apply_trcfg.config_summary(USER_CONFIG)
     if t == "词表":
         return apply_trcfg.words_overview(USER_CONFIG)
+    if t in ("导出配置", "导出"):
+        return export_link()
     if t == "暂停":
         changes = apply_trcfg.toggle_push(False, USER_CONFIG)
         return "⏸ 推送已暂停（抓取照常，发「恢复」继续）"
