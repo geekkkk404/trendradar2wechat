@@ -549,10 +549,10 @@ RestartSec=30
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now any2wechat >/dev/null 2>&1
+    systemctl enable any2wechat >/dev/null 2>&1
+    systemctl restart any2wechat   # restart 而非 enable --now：升级重跑载入新代码（P-41㊀）；未授权时亦无害
 
     if [ "$BRIDGE_AUTHED" = "1" ]; then
-      systemctl restart any2wechat   # 载入新凭证
       BH="fail"
       for i in $(seq 1 12); do
         bcode=$(curl -sm2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$A2W_PORT/health" 2>/dev/null) || bcode="000"
@@ -938,6 +938,12 @@ def _parse_words(fp):
     return n, groups, "\n".join(preview)
 
 
+def has_keywords(user_config):
+    """词表是否配置了至少一个关键词。空词表 = 命中全部热榜，current 预览会整版刷屏（守卫用）。"""
+    n, _g, _preview = _parse_words(user_config / "frequency_words.txt")
+    return n > 0
+
+
 def config_summary(user_config):
     import yaml
 
@@ -951,9 +957,12 @@ def config_summary(user_config):
     notif = cfg.get("notification") or {}
     n, g, _ = _parse_words(user_config / "frequency_words.txt")
     push_state = "推送中 ✅" if notif.get("enabled", True) else "已暂停 ⏸"
+    pace = ("全天（每 30 分钟一期）" if not sched.get("enabled", False)
+            else PRESET_ZH.get(sched.get("preset"), sched.get("preset", "-")))
     return (
-        f"📊 当前状态\n· 推送: {push_state}\n· 节奏: {sched.get('preset', '-')}\n"
-        f"· 形态: {rep.get('mode', '-')} / {rep.get('display_mode', '-')}\n"
+        f"📊 当前状态\n· 推送: {push_state}\n· 节奏: {pace}\n"
+        f"· 形态: {MODE_ZH.get(rep.get('mode'), rep.get('mode', '-'))} · "
+        f"{DMODE_ZH.get(rep.get('display_mode'), rep.get('display_mode', '-'))}\n"
         f"· 平台: {len(srcs)} 个｜RSS: {n_feed_on}/{len(feeds)} 个\n· 关键词: {n} 词 / {g} 组"
     )
 
@@ -1028,6 +1037,94 @@ def reply(text):
         raise RuntimeError(f"bridge HTTP {r.status}: {body[:120]}")
 
 
+def report_mode():
+    """当前 report.mode（只读）。解析失败回退 incremental——按最保守口径措辞。"""
+    try:
+        import yaml
+        cfg = yaml.safe_load((USER_CONFIG / "config.yaml").read_text(encoding="utf-8")) or {}
+        return (cfg.get("report") or {}).get("mode") or "incremental"
+    except Exception:
+        return "incremental"
+
+
+def _env_pairs(path):
+    """读 systemd EnvironmentFile → [(k, v)]，保序。值一律单引号包裹（安装器 upsert_env 约定，
+    即 P-43 记录的引号设计），此处按同约定剥引号还原。"""
+    out = []
+    try:
+        for ln in path.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            k, _, v = ln.partition("=")
+            k = k.strip()
+            if not k:
+                continue
+            v = v.strip()
+            if len(v) >= 2 and v.startswith("'") and v.endswith("'"):
+                v = v[1:-1].replace("'\\''", "'")
+            out.append((k, v))
+    except Exception as err:
+        log(f"[preview] 读取 {path} 失败: {err}")
+    return out
+
+
+def trigger_fetch(preview=False):
+    """触发一次抓取并返回如实的预期文案（P-41②/④）。
+
+    preview=True（方案 B，2026-11-05 站主拍板）：临时配置目录整目录复制 user-config 后
+    手术式翻 report.mode=current，起一次性运行——读者配完或按「立即推送」立刻看到当前
+    榜单命中内容；稳态配置与 incremental 防扰完全不动。上游零改动：
+    CONFIG_PATH/FREQUENCY_WORDS_PATH 为上游官方 env 入口（P-32 外置即建于其上）；
+    伴生文件随整目录复制满足上游「与 config.yaml 同目录」解析（P-37 教训）。
+    守卫：仅在词表非空时 preview——空词表 = 命中全部热榜，current 预览会整版刷屏。
+    preview 任何环节失败都退回普通触发（软失败，不影响推送本体）。
+    """
+    if preview:
+        tmp = None
+        try:
+            import shutil
+            import tempfile
+            import time
+            tmp = Path(tempfile.mkdtemp(prefix="trcfg-once-"))
+            shutil.copytree(USER_CONFIG, tmp, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns(".backup"))
+            apply_trcfg.apply_payload({"v": 1, "cfg": {"report": {"mode": "current"}}}, tmp)
+            unit = f"trcfg-once-{time.time_ns() // 1000}"
+            script = f'"{DEST / ".venv/bin/python"}" -m trendradar; rc=$?; rm -rf "{tmp}"; exit $rc'
+            # 不用 -p EnvironmentFile：实测它会压过 --setenv（CONFIG_PATH 指回真配置=预览失效），
+            # 改为显式逐项注入；CONFIG_PATH/FREQUENCY_WORDS_PATH 指临时目录（P-41④）
+            run_args = ["systemd-run", "--unit", unit, "--collect",
+                        # 不能用 Type=oneshot：其 start job 要等 ExecStart 跑完才返回，
+                        # systemd-run 会陪跑整个抓取（~40s）→ 触发超时降级（实测踩中）。
+                        # 默认 Type=simple 即发即返；RuntimeMaxSec 只作失控保险。
+                        "-p", "RuntimeMaxSec=1800",
+                        "-p", f"WorkingDirectory={DEST}"]
+            for k, v in _env_pairs(DEST / "trendradar.env"):
+                if k in ("CONFIG_PATH", "FREQUENCY_WORDS_PATH"):
+                    continue
+                run_args.append(f"--setenv={k}={v}")
+            run_args += ["--setenv=CONFIG_PATH=" + str(tmp / "config.yaml"),
+                         "--setenv=FREQUENCY_WORDS_PATH=" + str(tmp / "frequency_words.txt"),
+                         "/bin/bash", "-c", script]
+            subprocess.run(run_args, capture_output=True, text=True, timeout=5, check=True)
+            log("[preview] 一次性 current 预览已排程（unit=%s）" % unit)
+            return "⏳ 已触发立即抓取：当前榜单命中内容约 1 分钟送达（若暂无命中，之后命中即推）"
+        except Exception as err:
+            log(f"[preview] 一次性预览失败，退回普通触发: {err}")
+            if tmp is not None:
+                import shutil
+                shutil.rmtree(tmp, ignore_errors=True)
+            preview = False
+    subprocess.Popen(["systemctl", "start", FETCH_UNIT])
+    m = report_mode()
+    if m == "incremental":
+        return "⏳ 已触发立即抓取（增量模式：只有新上榜且命中关注词的内容会推送，命中即推）"
+    if m == "current":
+        return "⏳ 已触发立即抓取，当前榜单命中内容约 1 分钟送达"
+    return "⏳ 已触发立即抓取（按当前推送形态排程推送）"
+
+
 def handle_payload(rest):
     rest = rest.strip()
     try:
@@ -1041,9 +1138,8 @@ def handle_payload(rest):
         return f"❌ 配置未应用（文件未动）: {err}"
     except Exception as err:  # 兜底：任何异常都不落半态（apply 内部已保证不写盘）
         return f"❌ 配置未应用（文件未动）: {err.__class__.__name__}: {err}"
-    subprocess.Popen(["systemctl", "start", FETCH_UNIT])
     body = "✅ 配置已应用：\n" + "\n".join(f"· {c}" for c in changes)
-    return body + "\n⏳ 已触发立即抓取，约 1 分钟后收到新样式推送"
+    return body + "\n" + trigger_fetch(preview=apply_trcfg.has_keywords(USER_CONFIG))
 
 
 def dispatch(text):
@@ -1063,8 +1159,7 @@ def dispatch(text):
         changes = apply_trcfg.toggle_push(True, USER_CONFIG)
         return "▶️ 推送已恢复"
     if t == "立即推送":
-        subprocess.Popen(["systemctl", "start", FETCH_UNIT])
-        return "⏳ 已触发抓取，约 1 分钟后送达"
+        return trigger_fetch(preview=apply_trcfg.has_keywords(USER_CONFIG))
     if text.startswith("TRCFG1"):
         return "❌ 配置码格式: 以 TRCFG1: 开头（博客可视化页一键生成）"
     return "没听懂这条指令 🤔 发「帮助」查看我能做什么"
@@ -1119,9 +1214,12 @@ class H(BaseHTTPRequestHandler):
             log(f"[handler] 已回复 ({len(out)} 字符)")
         except Exception as err:
             log(f"[handler] 回复失败（桥未就绪？）: {err}")
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'{"ok":true}')
+        try:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+        except Exception:
+            pass  # 客户端（桥 relay 5s 超时/诊断 curl 断开）已断开属常态，勿刷 BrokenPipe 栈
 
     def log_message(self, *a):
         pass
@@ -1155,7 +1253,8 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now tr2w-handler >/dev/null 2>&1
+    systemctl enable tr2w-handler >/dev/null 2>&1
+    systemctl restart tr2w-handler   # restart 而非 enable --now：升级重跑载入新代码（P-41㊀ 实锤：stale 进程曾静默丢 sch 段）
     sleep 2
     if curl -sm2 "http://127.0.0.1:$TR2W_PORT/health" 2>/dev/null | grep -q '"ok":true'; then
       ok "管家已上线（微信里给 bot 发『帮助』查看指令菜单）"
