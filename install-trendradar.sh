@@ -1117,8 +1117,10 @@ import base64
 import binascii
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1142,6 +1144,8 @@ MENU_BODY = (
     "· 立即推送 —— 马上抓取并推一期\n"
     "· 导出配置 —— 重新生成配置链接\n"
     "· TRCFG1:… —— 粘贴配置码（博客可视化页生成），立即生效\n"
+    "· 设置AI密钥 sk-xxx —— 开启 AI 热点分析（腾讯 TokenHub 免费额度；结尾加「官方」二字 = DeepSeek 官方）\n"
+    "· 测试AI / 删除AI配置 —— 验证 AI 连通 / 关闭并删除 Key\n"
 )
 
 
@@ -1282,9 +1286,185 @@ def export_link():
     if not (p.get("freq") or p.get("cfg")):
         return "📭 当前是默认配置，无需导出（打开 geekkkk.com/trcfg 从头勾选即可）"
     code = base64.urlsafe_b64encode(
-        json.dumps(p, ensure_ascii=False).encode("utf-8")).decode().rstrip("=")
+            json.dumps(p, ensure_ascii=False).encode("utf-8")).decode().rstrip("=")
     return ("📋 打开链接即载入你的当前配置（改完点生成 → 微信发回即可）：\n"
             f"https://geekkkk.com/trcfg#c={code}")
+
+
+# ============================== AI 通道（P-48，2026-11-05 定型） ==============================
+# 机制（POC 实证）：全部走 trendradar.env 的上游官方 AI_* 覆盖链（loader.py env 优先于
+# config.yaml）+ regions.ai_analysis 显示开关手术一行；fetch 瞬态服务每次启动重读
+# EnvironmentFile → 零重启、下一期生效。Key 结构性不进 TRCFG1/导出/#c= 链接（export
+# 读不到 env）。TokenHub OpenAI 兼容端点实测三模型对比后默认 deepseek-flash（原厂直供，
+# 17.9s 全绿；hy4/GLM 思维链会吃光上游 max_tokens=5000 致空响应，勿设为默认）。
+ENV_FILE = DEST / "trendradar.env"
+AI_ENV_KEYS = ("AI_API_KEY", "AI_MODEL", "AI_API_BASE", "AI_TIMEOUT", "AI_ANALYSIS_ENABLED")
+TOKENHUB_BASE = "https://tokenhub.tencentmaas.com/v1"
+TOKENHUB_MODEL = "openai/deepseek/deepseek-flash"
+_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{20,200}$")
+_REGIONS_AI = re.compile(r"^(\s+)ai_analysis:(\s+)(true|false)(\s*(?:#.*)?)$")
+
+
+def _mask_key(key):
+    """Key 打码：首 5 字符 + ******（上游 analyzer.py 同款惯例）。永不回显完整 Key。"""
+    return (key[:5] + "******") if len(key) >= 5 else "******"
+
+
+def _write_env(set_pairs, remove_keys=()):
+    """upsert trendradar.env：先删待写键与 remove_keys 的旧行，再按 P-43 单引号约定追加。
+    值均来自白名单校验（KEY_RE）或本文件常量，无引号注入面；写后 chmod 600。
+    直接改文件而非进程 env：handler 常驻而 env 常变，逐请求读文件才见新值。"""
+    rm = set(remove_keys) | {k for k, _v in set_pairs}
+    try:
+        kept = []
+        for ln in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            k = ln.split("=", 1)[0].strip() if "=" in ln else None
+            if k not in rm:
+                kept.append(ln)
+    except FileNotFoundError:
+        kept = []
+    for k, v in set_pairs:
+        if "'" in v or "\n" in v:
+            raise ValueError(f"env 值含非法字符: {k}")
+        kept.append(f"{k}='{v}'")
+    ENV_FILE.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    os.chmod(ENV_FILE, 0o600)
+
+
+def _regions_ai_flip(on):
+    """手术翻 regions.ai_analysis 显示开关（唯一锚点：缩进 ai_analysis:+bool 值；
+    顶层 ai_analysis: 节头无值不会命中）。保留行尾注释；改动前按 .backup/ 约定备份。"""
+    want = "true" if on else "false"
+    path = USER_CONFIG / "config.yaml"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return False
+    for i, ln in enumerate(lines):
+        m = _REGIONS_AI.match(ln)
+        if m:
+            if m.group(3) == want:
+                return False
+            apply_trcfg._backup(USER_CONFIG, ["config.yaml"])
+            lines[i] = f"{m.group(1)}ai_analysis:{m.group(2)}{want}{m.group(4)}"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return True
+    log("[ai] regions.ai_analysis 锚点未找到（种子异常？），显示开关未动")
+    return False
+
+
+def _ai_channel(env):
+    """→ (渠道名, 模型展示名)。与 cmd_set_ai_key 的三种写入口径一致。"""
+    base = env.get("AI_API_BASE", "")
+    model = env.get("AI_MODEL", "")
+    if base == TOKENHUB_BASE:
+        return "腾讯 TokenHub", "deepseek-flash（原厂直供）"
+    if base:
+        return "自定义接口", model or "-"
+    if model:
+        return "自定义模型", model
+    return "DeepSeek 官方", "上游默认模型"
+
+
+def ai_status_line():
+    """「状态」指令的 AI 行（只读）。Key 只打码。"""
+    env = dict(_env_pairs(ENV_FILE))
+    key = env.get("AI_API_KEY", "")
+    if not key:
+        return "· AI 分析: 未开启（发「设置AI密钥 sk-你的密钥」开启，微信零终端）"
+    prov, model = _ai_channel(env)
+    if env.get("AI_ANALYSIS_ENABLED", "") != "true":
+        return f"· AI 分析: Key 已存（{_mask_key(key)}）但总开关未开（重发设置指令即可修复）"
+    return f"· AI 分析: 已启用（{prov} · {model} · Key {_mask_key(key)}）"
+
+
+def cmd_set_ai_key(rest):
+    """「设置AI密钥 <key> [官方]」：默认 TokenHub 预置（模型/接口/超时全自动），
+    结尾「官方」= DeepSeek 官方（清掉 TokenHub 预置键，走上游默认模型）。
+    小票回执（P-42 风格）：逐项回显 + 免费额度/泄露面如实提示。"""
+    official = False
+    rest = rest.strip()
+    if rest.endswith("官方"):
+        official = True
+        rest = rest[:-2].strip()
+    key = rest
+    if not _KEY_RE.match(key):
+        return ("❌ Key 格式不合法（sk- 开头的字母/数字/点/连字符，20-200 字符；已忽略，未写入）\n"
+                "· 腾讯 TokenHub 开通+建 Key: console.cloud.tencent.com/tokenhub\n"
+                "· 正确用法: 设置AI密钥 sk-xxxxxxxx")
+    if official:
+        _write_env([("AI_API_KEY", key), ("AI_ANALYSIS_ENABLED", "true")],
+                   remove_keys=("AI_MODEL", "AI_API_BASE", "AI_TIMEOUT"))
+        ch = "· 渠道: DeepSeek 官方（上游默认模型）\n· 计费: 按 DeepSeek 官方价目（便宜档，需账户有余额）"
+    else:
+        _write_env([
+            ("AI_API_KEY", key),
+            ("AI_MODEL", TOKENHUB_MODEL),
+            ("AI_API_BASE", TOKENHUB_BASE),
+            ("AI_TIMEOUT", "300"),
+            ("AI_ANALYSIS_ENABLED", "true"),
+        ])
+        ch = ("· 渠道: 腾讯 TokenHub · 模型 deepseek-flash（原厂直供）\n"
+              "· 计费: 新用户免费额度（约每期消耗几千 tokens）；额度用尽后需开通后付费继续，或发「删除AI配置」关闭")
+    _regions_ai_flip(True)
+    return (f"✅ AI 分析 → 已启用\n{ch}\n"
+            f"· Key: {_mask_key(key)}（已存服务器 env 文件，权限 600）\n"
+            "· 下一期推送起生效；当期无命中内容则该期无 AI 段\n"
+            "· 发「测试AI」可立即验证连通\n"
+            "· 如怀疑泄露: 去控制台重置 Key 后重发本指令即可")
+
+
+def cmd_test_ai():
+    """「测试AI」：用服务器上已配置的 Key 发一次最小调用（max_tokens=300 封顶），
+    把「贴错 Key 干等下期」变成当场知道（P-41 承诺如实化的 AI 版）。失败信息短截，
+    不回显完整诊断（防诊断文本携带 Key 片段）。"""
+    env = dict(_env_pairs(ENV_FILE))
+    key = env.get("AI_API_KEY", "")
+    if not key:
+        return "❌ 尚未配置 AI Key（发「设置AI密钥 sk-你的密钥」先配置）"
+    cfg = {
+        "MODEL": env.get("AI_MODEL") or "deepseek/deepseek-v4-flash",
+        "API_KEY": key,
+        "API_BASE": env.get("AI_API_BASE", ""),
+        "TIMEOUT": 90, "TEMPERATURE": 1.0, "MAX_TOKENS": 300,
+        "NUM_RETRIES": 0, "FALLBACK_MODELS": [], "EXTRA_PARAMS": {},
+    }
+    code = (
+        "import sys, json\n"
+        f"sys.path.insert(0, {str(DEST)!r})\n"
+        "from trendradar.ai.client import AIClient\n"
+        "cfg = json.loads(sys.stdin.read())\n"
+        "c = AIClient(cfg)\n"
+        "out = c.chat([{\'role\': \'user\', \'content\': \'回复两个字: 成功\'}])\n"
+        "print(out[:60])\n"
+    )
+    prov, model = _ai_channel(env)
+    t0 = time.time()
+    try:
+        p = subprocess.run([str(DEST / ".venv/bin/python"), "-c", code],
+                           input=json.dumps(cfg), capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return f"❌ AI 测试超时（120s 无响应）· {prov}\n稍后重试；若持续超时发「删除AI配置」关闭"
+    dt = time.time() - t0
+    if p.returncode != 0:
+        tail = [l for l in (p.stderr or "").strip().splitlines() if l.strip()]
+        brief = (tail[-1][:80] + "…") if tail else "未知错误"
+        return (f"❌ AI 测试失败 · {prov}\n· {brief}\n"
+                "常见原因: Key 无效/额度用尽/账户未开通；确认后重发「设置AI密钥」")
+    out = (p.stdout or "").strip()
+    if not out:
+        return (f"⚠️ AI 接口连通但模型回复为空 · {prov}\n"
+                "该模型可能是思考型（思维链耗尽输出预算）；建议重发「设置AI密钥」用默认 TokenHub 模型")
+    return f"✅ AI 连通 · {prov} · {model}\n· 耗时 {dt:.0f}s，模型回复: {out[:40]}"
+
+
+def cmd_del_ai():
+    """「删除AI配置」：清全部 AI_* env 键 + 显示开关翻回 false（对称撤销，回 P-44 默认态）。"""
+    _write_env([], remove_keys=AI_ENV_KEYS)
+    _regions_ai_flip(False)
+    return ("🗑 AI 配置已删除\n"
+            "· AI 分析 → 已关闭（回到默认省流模式，推送不再有 AI 段）\n"
+            "· Key 已从服务器移除；想再开启随时发「设置AI密钥」")
 
 
 def handle_payload(rest):
@@ -1307,11 +1487,13 @@ def handle_payload(rest):
 def dispatch(text):
     if text.startswith("TRCFG1:"):
         return handle_payload(text[len("TRCFG1:"):])
+    if text.startswith("设置AI密钥"):
+        return cmd_set_ai_key(text[len("设置AI密钥"):])
     t = text.strip().lower()
     if t in ("帮助", "菜单", "help", "h", "?", "？"):
         return menu_text()
     if t == "状态":
-        return apply_trcfg.config_summary(USER_CONFIG)
+        return apply_trcfg.config_summary(USER_CONFIG) + "\n" + ai_status_line()
     if t == "词表":
         return apply_trcfg.words_overview(USER_CONFIG)
     if t in ("导出配置", "导出"):
@@ -1324,6 +1506,10 @@ def dispatch(text):
         return "▶️ 推送已恢复"
     if t == "立即推送":
         return trigger_fetch(preview=apply_trcfg.has_keywords(USER_CONFIG))
+    if t in ("测试ai", "测试"):
+        return cmd_test_ai()
+    if t in ("删除ai配置", "关闭ai"):
+        return cmd_del_ai()
     if text.startswith("TRCFG1"):
         return "❌ 配置码格式: 以 TRCFG1: 开头（博客可视化页一键生成）"
     return "没听懂这条指令 🤔 发「帮助」查看我能做什么"
@@ -1481,6 +1667,7 @@ if [ "$WECHAT_BRIDGE" = "1" ] && [ "$BRIDGE_OK" = "1" ]; then
     fi
       echo "       ▶ 桥日志: journalctl -u any2wechat -f"
       echo "       💬 微信指令: 给 bot 发『帮助』查看菜单（改配置/暂停/恢复/词表/状态）"
+      echo "       🤖 AI 热点分析: 微信发『设置AI密钥 sk-你的密钥』开启（腾讯 TokenHub 免费额度，步骤见 geekkkk.com/trcfg）"
 elif [ -n "$CHANNELS" ]; then
   echo "    📱 已配置推送:$CHANNELS"
 else
