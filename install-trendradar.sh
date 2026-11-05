@@ -520,6 +520,8 @@ if [ "$WECHAT_BRIDGE" = "1" ]; then
         mkdir -p /usr/local/lib/nodejs
         tar -xJf /tmp/node.tar.xz -C /usr/local/lib/nodejs --strip-components=1 >/dev/null 2>&1 \
           && ln -sf /usr/local/lib/nodejs/bin/node "$NODE_BIN" \
+          && ln -sf /usr/local/lib/nodejs/bin/npm /usr/local/bin/npm \
+          && ln -sf /usr/local/lib/nodejs/bin/npx /usr/local/bin/npx \
           && NODE_OK=1
         rm -f /tmp/node.tar.xz
       fi
@@ -558,6 +560,21 @@ if [ "$WECHAT_BRIDGE" = "1" ]; then
   if [ -f "$A2W_SRC/src/main.mjs" ]; then
     BRIDGE_OK=1
     mkdir -p "$A2W_DATA" && chmod 700 "$A2W_DATA"
+
+    # 桥运行时依赖（v0.4.0 起唯一依赖 qrcode——配置二维码图片，P-53；npmmirror 秒级）
+    if [ -f "$A2W_SRC/package.json" ] && grep -q '"dependencies"' "$A2W_SRC/package.json"; then
+      NPM_BIN="$(command -v npm || echo /usr/local/lib/nodejs/bin/npm)"
+      if [ -x "$NPM_BIN" ]; then
+        echo "  安装桥依赖（npmmirror）..."
+        if (cd "$A2W_SRC" && "$NPM_BIN" install --omit=dev --no-audit --no-fund --registry=https://registry.npmmirror.com >/dev/null 2>&1) && [ -d "$A2W_SRC/node_modules/qrcode" ]; then
+          ok "桥依赖就绪"
+        else
+          warn "桥依赖安装失败（配置二维码将不可用，文本推送不受影响）；可重跑本脚本重试"
+        fi
+      else
+        warn "npm 不可用（Node 安装异常？），跳过桥依赖——配置二维码将不可用，文本推送不受影响"
+      fi
+    fi
 
     # 扫码授权：交互终端现场完成；管道/自动化（非 TTY）自动跳过，命令见完成摘要
     if [ -t 0 ]; then
@@ -1188,18 +1205,23 @@ MENU_BODY = (
 
 
 def menu_text():
-    """帮助菜单：尾部入口动态带当前配置（站主复测反馈 2026-11-05）——打开即改，
-    无需先发「导出配置」，同时消除「空表单误覆盖」陷阱；默认配置时回落静态入口。"""
+    """帮助菜单（P-53 QR 形态）：配置非默认时附配置二维码——长按识别打开即改，
+    消除「空表单误覆盖」陷阱；链接不再以文本形态出现。默认配置回落静态入口。"""
     tail = "🌐 配置页: geekkkk.com/trcfg"
+    qr = None
     try:
         p = apply_trcfg.export_payload(USER_CONFIG)
         if p.get("freq") or p.get("cfg"):
-            code = base64.urlsafe_b64encode(
-                json.dumps(p, ensure_ascii=False).encode("utf-8")).decode().rstrip("=")
-            tail = f"🌐 配置页（已含你的当前配置，打开即改）: https://geekkkk.com/trcfg#c={code}"
+            code = trcfg_code(p)
+            link = f"https://geekkkk.com/trcfg#c={code}"
+            if len(link.encode("utf-8")) <= QR_CONTENT_MAX:
+                tail = "🌐 配置二维码随后附上（长按识别，打开即改你的当前配置）"
+                qr = link
+            else:
+                tail = "🌐 配置页: geekkkk.com/trcfg ｜ 词表较大，发「导出配置」取配置码"
     except Exception as err:
         log(f"[menu] 动态入口生成失败，回落静态: {err}")
-    return MENU_BODY + tail
+    return MENU_BODY + tail, qr
 
 
 def log(*a):
@@ -1214,16 +1236,19 @@ def owner_id():
         return ""
 
 
-def reply(text):
+def reply(text, qr_content=None):
+    body = {"content": text}
+    if qr_content:
+        body["qr_content"] = qr_content
     req = urllib.request.Request(
         BRIDGE_URL,
-        data=json.dumps({"content": text}).encode("utf-8"),
+        data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=15) as r:
-        body = r.read().decode("utf-8", "replace")
+        data = r.read().decode("utf-8", "replace")
     if r.status != 202:
-        raise RuntimeError(f"bridge HTTP {r.status}: {body[:120]}")
+        raise RuntimeError(f"bridge HTTP {r.status}: {data[:120]}")
 
 
 def report_mode():
@@ -1314,19 +1339,50 @@ def trigger_fetch(preview=False):
     return "⏳ 已触发立即抓取（按当前推送形态排程推送）"
 
 
+# ============================== 配置载荷 zlib（P-53，D14 预留兑现） ==============================
+# hash 形态：z 前缀 + b64url(zlib(json))。中文词表 deflate 仅 ~1.8x，但足以把 QR 内容
+# 压进容量（实测 53 词配置 2979B JSON → 1689B）；页面端 DecompressionStream('deflate') 解压。
+import zlib
+
+QR_CONTENT_MAX = 2500  # QR 内容字节上限（version 40-L 容量 2953B，留纠错与 URL 头余量）
+
+
+def trcfg_code(payload):
+    """载荷 → zlib 配置码（z 前缀 + b64url），QR 与文本回退共用。"""
+    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return "z" + base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode().rstrip("=")
+
+
+def parse_trcfg_code(code):
+    """配置码 → 载荷（handle_payload 消费）。兼容旧版明文码与新 zlib 码。"""
+    code = code.strip()
+    if code.startswith("z"):
+        raw = zlib.decompress(base64.urlsafe_b64decode(code[1:] + "=" * (-len(code[1:]) % 4)))
+        return json.loads(raw.decode("utf-8"))
+    return json.loads(base64.urlsafe_b64decode(code + "=" * (-len(code) % 4)).decode("utf-8"))
+
+
 def export_link():
-    """「导出配置」→ 带配置态的 trcfg 链接（P-47）：打开页面即载入当前全部配置，
-    改完生成新配置码发回即生效。链接只经微信消息传递，不经任何第三方存储。"""
+    """「导出配置」（P-47/P-53 双形态）：短文本 + 配置二维码——微信长按识别即打开
+    带当前配置的 trcfg 页（hash 不发服务器，D13 不破；链接不再以文本形态出现，
+    无分批断裂无点击压力）。zlib 载荷超 QR 容量 → 回退文本码（复制粘贴导入）。"""
     try:
         p = apply_trcfg.export_payload(USER_CONFIG)
     except Exception as err:
         return f"❌ 导出失败: {err.__class__.__name__}: {err}"
     if not (p.get("freq") or p.get("cfg")):
         return "📭 当前是默认配置，无需导出（打开 geekkkk.com/trcfg 从头勾选即可）"
-    code = base64.urlsafe_b64encode(
-            json.dumps(p, ensure_ascii=False).encode("utf-8")).decode().rstrip("=")
-    return ("📋 打开链接即载入你的当前配置（改完点生成 → 微信发回即可）：\n"
-            f"https://geekkkk.com/trcfg#c={code}")
+    code = trcfg_code(p)
+    link = f"https://geekkkk.com/trcfg#c={code}"
+    if len(link.encode("utf-8")) <= QR_CONTENT_MAX:
+        text = ("📋 配置二维码这就来——微信长按识别即可打开你的配置页\n"
+                "（改完点「生成配置码」→ 微信发回即生效）\n"
+                "🌐 网页入口: geekkkk.com/trcfg")
+        return text, link
+    # 超大配置回退：zlib 文本码（用户复制 → 页面导入框粘贴）
+    return ("📋 你的词表较大，二维码放不下，改用配置码：\n"
+            "👇 复制下面整串（含 TRCFG1z: 开头），打开 geekkkk.com/trcfg 粘进「导入」框\n"
+            f"TRCFG1z:{code}")
 
 
 # ============================== AI 通道（P-48，2026-11-05 定型） ==============================
@@ -1508,9 +1564,12 @@ def cmd_del_ai():
 def handle_payload(rest):
     rest = rest.strip()
     try:
-        raw = base64.urlsafe_b64decode(rest + "=" * (-len(rest) % 4))
-        payload = json.loads(raw.decode("utf-8"))
-    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as err:
+        if rest.startswith("TRCFG1z:"):
+            payload = parse_trcfg_code(rest[len("TRCFG1z:"):])  # zlib 码（P-53 超大配置回退路径）
+        else:
+            raw = base64.urlsafe_b64decode(rest + "=" * (-len(rest) % 4))
+            payload = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, zlib.error, ValueError) as err:
         return f"❌ 配置码解码失败: {err}"
     try:
         changes = apply_trcfg.apply_payload(payload, USER_CONFIG)
@@ -1523,6 +1582,8 @@ def handle_payload(rest):
 
 
 def dispatch(text):
+    if text.startswith("TRCFG1z:"):
+        return handle_payload(text)  # zlib 码（P-53 超大配置回退），handle_payload 内部再剥前缀
     if text.startswith("TRCFG1:"):
         return handle_payload(text[len("TRCFG1:"):])
     if text.startswith("设置AI密钥"):
@@ -1597,9 +1658,12 @@ class H(BaseHTTPRequestHandler):
         except Exception as err:
             log(f"[handler] 处理异常: {err}")
             out = f"❌ 处理失败: {err.__class__.__name__}: {err}"
+        qr = None
+        if isinstance(out, tuple):
+            out, qr = out  # (文本, QR内容) 双形态——QR 由桥生成图片消息，文本不再携带超长链接
         try:
-            reply(out)
-            log(f"[handler] 已回复 ({len(out)} 字符)")
+            reply(out, qr_content=qr)
+            log(f"[handler] 已回复 ({len(out)} 字符{' + QR' if qr else ''})")
         except Exception as err:
             log(f"[handler] 回复失败（桥未就绪？）: {err}")
         try:
