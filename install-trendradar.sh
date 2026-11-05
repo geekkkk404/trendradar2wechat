@@ -1133,17 +1133,31 @@ RELAY_TOKEN = os.environ.get("TR2W_RELAY_TOKEN", "")
 BRIDGE_URL = os.environ.get("TR2W_BRIDGE_URL", "http://127.0.0.1:8788/webhook")
 FETCH_UNIT = "trendradar-fetch"
 
-MENU = (
+MENU_BODY = (
     "📖 指令菜单（tr2w 管家）\n"
     "· 帮助 —— 本菜单\n"
     "· 状态 —— 当前配置速览\n"
     "· 词表 —— 查看关注关键词\n"
     "· 暂停 / 恢复 —— 停止/恢复推送\n"
     "· 立即推送 —— 马上抓取并推一期\n"
-    "· 导出配置 —— 生成链接，打开即载入当前配置（改完发回）\n"
+    "· 导出配置 —— 重新生成配置链接\n"
     "· TRCFG1:… —— 粘贴配置码（博客可视化页生成），立即生效\n"
-    "🌐 配置页: geekkkk.com/trcfg"
 )
+
+
+def menu_text():
+    """帮助菜单：尾部入口动态带当前配置（站主复测反馈 2026-11-05）——打开即改，
+    无需先发「导出配置」，同时消除「空表单误覆盖」陷阱；默认配置时回落静态入口。"""
+    tail = "🌐 配置页: geekkkk.com/trcfg"
+    try:
+        p = apply_trcfg.export_payload(USER_CONFIG)
+        if p.get("freq") or p.get("cfg"):
+            code = base64.urlsafe_b64encode(
+                json.dumps(p, ensure_ascii=False).encode("utf-8")).decode().rstrip("=")
+            tail = f"🌐 配置页（已含你的当前配置，打开即改）: https://geekkkk.com/trcfg#c={code}"
+    except Exception as err:
+        log(f"[menu] 动态入口生成失败，回落静态: {err}")
+    return MENU_BODY + tail
 
 
 def log(*a):
@@ -1295,7 +1309,7 @@ def dispatch(text):
         return handle_payload(text[len("TRCFG1:"):])
     t = text.strip().lower()
     if t in ("帮助", "菜单", "help", "h", "?", "？"):
-        return MENU
+        return menu_text()
     if t == "状态":
         return apply_trcfg.config_summary(USER_CONFIG)
     if t == "词表":
