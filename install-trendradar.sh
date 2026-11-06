@@ -606,7 +606,7 @@ Environment=BRIDGE_HOST=127.0.0.1
 Environment=BRIDGE_PORT=$A2W_PORT
 Environment=BRIDGE_RELAY_URL=http://127.0.0.1:$TR2W_PORT/inbound
 Environment=BRIDGE_RELAY_TOKEN=$TR2W_RELAY_TOKEN
-Environment="BRIDGE_FOOTER_TEXT=📖 微信改配置：geekkkk.com/trcfg ｜ 发「帮助」看指令"
+Environment="BRIDGE_FOOTER_TEXT=📖 微信发「帮助」改配置"
 Environment="BRIDGE_FOOTER_ONCE_PER_DAY=1"
 Restart=always
 RestartSec=30
@@ -1205,22 +1205,22 @@ MENU_BODY = (
 
 
 def menu_text():
-    """帮助菜单（P-53 QR 形态）：配置非默认时附配置二维码——长按识别打开即改，
-    消除「空表单误覆盖」陷阱；链接不再以文本形态出现。默认配置回落静态入口。"""
-    tail = "🌐 配置页: geekkkk.com/trcfg"
+    """帮助菜单（P-53 全面二维码化，站主决策 2026-11-06）：配置态一律以二维码出——
+    长按识别打开即改；静态裸链接从微信消息中移除（根除「点裸链接→空表单→生成
+    清空配置」陷阱 + 不再触发微信对长链接的安全拦截）。默认配置态同样发 QR
+    （默认载荷极小，低密度高识别率）。"""
     qr = None
     try:
         p = apply_trcfg.export_payload(USER_CONFIG)
-        if p.get("freq") or p.get("cfg"):
-            code = trcfg_code(p)
-            link = f"https://geekkkk.com/trcfg#c={code}"
-            if len(link.encode("utf-8")) <= QR_CONTENT_MAX:
-                tail = "🌐 配置二维码随后附上（长按识别，打开即改你的当前配置）"
-                qr = link
-            else:
-                tail = "🌐 配置页: geekkkk.com/trcfg ｜ 词表较大，发「导出配置」取配置码"
+        link = f"https://geekkkk.com/trcfg#c={trcfg_code(p)}"
+        if len(link.encode("utf-8")) <= QR_CONTENT_MAX:
+            tail = "🌐 配置二维码随后附上——微信长按识别，打开即改你的当前配置"
+            qr = link
+        else:
+            tail = "🌐 词表较大：发「导出配置」取配置码，粘进配置页导入框即改"
     except Exception as err:
-        log(f"[menu] 动态入口生成失败，回落静态: {err}")
+        tail = "🌐 配置入口异常：发「导出配置」取配置码"
+        log(f"[menu] 动态入口生成失败: {err}")
     return MENU_BODY + tail, qr
 
 
@@ -1371,17 +1371,16 @@ def export_link():
     except Exception as err:
         return f"❌ 导出失败: {err.__class__.__name__}: {err}"
     if not (p.get("freq") or p.get("cfg")):
-        return "📭 当前是默认配置，无需导出（打开 geekkkk.com/trcfg 从头勾选即可）"
+        return "📭 当前是默认配置，无需导出——发「帮助」即可拿到配置二维码，打开即从头勾选"
     code = trcfg_code(p)
     link = f"https://geekkkk.com/trcfg#c={code}"
     if len(link.encode("utf-8")) <= QR_CONTENT_MAX:
         text = ("📋 配置二维码这就来——微信长按识别即可打开你的配置页\n"
-                "（改完点「生成配置码」→ 微信发回即生效）\n"
-                "🌐 网页入口: geekkkk.com/trcfg")
+                "（改完点「生成配置码」→ 微信发回即生效）")
         return text, link
-    # 超大配置回退：zlib 文本码（用户复制 → 页面导入框粘贴）
+    # 超大配置回退：zlib 文本码（复制 → 页面导入框粘贴，导入即回填不清空）
     return ("📋 你的词表较大，二维码放不下，改用配置码：\n"
-            "👇 复制下面整串（含 TRCFG1z: 开头），打开 geekkkk.com/trcfg 粘进「导入」框\n"
+            "👇 复制下面整串，在配置页（geekkkk.com/trcfg）的「导入」框粘贴——导入会恢复你的全部配置，不会清空\n"
             f"TRCFG1z:{code}")
 
 
