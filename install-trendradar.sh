@@ -375,7 +375,7 @@ KWEOF
 此目录存放你的个性化配置；重跑安装脚本升级时【不会被覆盖】。
 
   frequency_words.txt   关注关键词（追什么词、排除什么词；默认已按 AI/科技 预置）
-  config.yaml           主配置（推送节奏/信息源/报告形态等，文件内含中文注释）
+  config.yaml           主配置（信息源/推送分组等，文件内含中文注释）
 
 修改后下次抓取自动生效；微信里发「推送」可立即抓取并推送。
 MDEOF
@@ -495,6 +495,7 @@ if [ "$WECHAT_BRIDGE" = "1" ] && [ "$TIMER_OPTIN" != "1" ]; then
   ok "拉取模式：定时抓取已停用，微信发「推送 / 获取 / 新闻」即抓即推（--enable-timer 可启用定时）"
 else
   systemctl enable --now trendradar-fetch.timer >/dev/null 2>&1
+  ok "定时抓取已排程（每 30 分钟，systemd timer 持久化）"  # P-57④：仅定时形态打印（拉取分支已有自己的行）
 fi
 if [ "$WITH_MCP" = "1" ]; then
   systemctl enable trendradar-mcp >/dev/null 2>&1 && systemctl restart trendradar-mcp && ok "MCP 服务已启动（$MCP_HOST:$MCP_PORT）"
@@ -504,7 +505,6 @@ if [ "$NO_WEB" = "1" ]; then
 else
   ok "网页报告服务已启动（0.0.0.0:$PORT）"
 fi
-ok "定时抓取已排程（每 30 分钟，systemd timer 持久化）"
 
 # ----------------------------- 首次抓取 ---------------------------------------
 step "首次抓取（真实运行一次，生成报告与推送）"
@@ -695,24 +695,20 @@ import os
 
 USER_CONFIG = Path(os.environ.get("TR2W_USER_CONFIG", "/opt/TrendRadar/user-config"))
 
-SCHEDULE_PRESETS = {"always_on", "morning_evening", "office_hours", "night_owl", "custom"}
-REPORT_MODES = {"daily", "current", "incremental"}
 DISPLAY_MODES = {"keyword", "platform"}
 # 回执展示用中文名（推送里不出现英文裸值）
-PRESET_ZH = {
-    "always_on": "全天模板",
-    "morning_evening": "早晚报模板（白天照常 + 晚 20-22 点当日汇总）",
-    "office_hours": "办公时间模板（工作日 9-11/13-15/17-19 点，周末 8-23 点）",
-    "night_owl": "夜猫模板（15-17 点、22 点-次日 1 点）",
-    "custom": "自定义模板",
-}
-MODE_ZH = {"current": "实时热榜", "daily": "当日汇总", "incremental": "只推新上榜"}
+# P-57（2026-11-06 站主拍板）：拉取模式为唯一默认形态——schedule 节奏与 report.mode 的
+# 白名单/中文名已全线摘除（配置页对应控件删除；拉取路径恒走 current 预览，稳态 mode 被架空；
+# 上游模板 schedule.enabled 本就默认 false，窗口门控无来源）。
 DMODE_ZH = {"keyword": "按主题分组", "platform": "按来源分组"}
 KEEP_BACKUPS = 30
 _SECTION = re.compile(r"^([A-Za-z_]+):\s*(?:#.*)?$")
 _ENTRY = re.compile(r"^(\s*)- id:\s*[\"']?([A-Za-z0-9_-]+)[\"']?\s*(?:#.*)?$")
 _ENTRY_C = re.compile(r"^(\s*)#\s*- id:\s*[\"']?([A-Za-z0-9_-]+)[\"']?\s*(?:#.*)?$")
-_WORD_BAD = re.compile(r"(^[\s#！!＋+＠@\[/]|[\r\n])")
+# P-56：`/` 前缀放行——它是上游词表 DSL 的正则词条法（/…/ => 别名），官方默认词表 30 词
+# 以此开头，旧规则会拒掉整份默认配置；其余前缀（注释/必须/排除/条数/组头）仍是保留字。
+# 与博客页 chkWord 同规则（geekkkk-site static/trcfg）。
+_WORD_BAD = re.compile(r"(^[\s#！!＋+＠@\[]|[\r\n])")
 
 
 class ApplyError(Exception):
@@ -817,15 +813,17 @@ def _toggle_feed(lines, fid, on, changes):
     if cur is None:
         raise ApplyError(f"未知 RSS 源 id: {fid!r}")
     start, end, indent = cur
-    pat = re.compile(r"^(\s+enabled\s*:\s*).*$")
+    # P-50：值单独捕获比对，行尾注释不参与判定、改写时原样保留（旧行为会把
+    # `enabled: false # 注释` 误报为变化并抹掉注释）
+    pat = re.compile(r"^(\s+enabled\s*:\s*)([A-Za-z]+)(\s*#.*)?\s*$")
     want = "true" if on else "false"
     for i in range(start, end):
         m = pat.match(lines[i])
         if m:
-            if lines[i].rstrip().endswith(want):
+            if m.group(2).lower() == want:
                 changes.append(f"RSS {fid} 已是{'启用' if on else '停用'}（无变化）")
             else:
-                lines[i] = f"{m.group(1)}{want}"
+                lines[i] = f"{m.group(1)}{want}{m.group(3) or ''}"
                 changes.append(f"{'启用' if on else '停用'} RSS {fid}")
             return
     if on:
@@ -841,7 +839,7 @@ def _word(w, what):
         raise ApplyError(f"{what}存在空词条")
     if _WORD_BAD.search(w):
         raise ApplyError(f"{what}词条含非法字符/语法前缀: {w[:30]!r}")
-    if len(w) > 60:
+    if len(w) > 200:  # P-56：官方默认词表正则词（/…/ => 别名）最长 113 字，60 上限会拒掉整份默认配置
         raise ApplyError(f"{what}词条过长: {w[:30]!r}…")
     return w
 
@@ -901,19 +899,8 @@ def apply_payload(payload, user_config):
     changes = []
     staged = []
 
-    sched = cfg.get("schedule") or {}
-    if "enabled" in sched:
-        b = sched["enabled"]
-        if not isinstance(b, bool):
-            raise ApplyError("schedule.enabled 需为 true/false")
-        staged.append(lambda b=b: _patch_scalar(
-            lines, "schedule", "enabled", "true" if b else "false", changes,
-            "推送节奏 → 按模板时段推送" if b else "推送节奏 → 全天（每 30 分钟一期）"))
-    if "preset" in sched:
-        v = sched["preset"]
-        if v not in SCHEDULE_PRESETS:
-            raise ApplyError(f"schedule.preset 非法: {v!r}（可选: {sorted(SCHEDULE_PRESETS)}）")
-        staged.append(lambda v=v: _patch_scalar(lines, "schedule", "preset", f'"{v}"', changes, f"推送节奏 → {PRESET_ZH[v]}"))
+    # P-57：cfg.schedule / cfg.report.mode 不再消费——拉取模式下无定时无稳态形态分歧，
+    # 页面/导出也不再生成这两段；白名单机制对未知键天然静默忽略，旧码不会报错。
     notif = cfg.get("notification") or {}
     if "enabled" in notif:
         b = notif["enabled"]
@@ -921,11 +908,6 @@ def apply_payload(payload, user_config):
             raise ApplyError("notification.enabled 需为 true/false")
         staged.append(lambda b=b: _patch_scalar(lines, "notification", "enabled", "true" if b else "false", changes, "恢复推送" if b else "暂停推送"))
     rep = cfg.get("report") or {}
-    if "mode" in rep:
-        v = rep["mode"]
-        if v not in REPORT_MODES:
-            raise ApplyError(f"report.mode 非法: {v!r}（可选: {sorted(REPORT_MODES)}）")
-        staged.append(lambda v=v: _patch_scalar(lines, "report", "mode", f'"{v}"', changes, f"每期内容 → {MODE_ZH[v]}"))
     if "display_mode" in rep:
         v = rep["display_mode"]
         if v not in DISPLAY_MODES:
@@ -1066,16 +1048,14 @@ def config_summary(user_config):
     feeds = (cfg.get("rss") or {}).get("feeds") or []
     n_feed_on = sum(1 for f in feeds if f.get("enabled", True))
     rep = cfg.get("report") or {}
-    sched = cfg.get("schedule") or {}
     notif = cfg.get("notification") or {}
     n, g, _ = _parse_words(user_config / "frequency_words.txt")
     push_state = "推送中 ✅" if notif.get("enabled", True) else "已暂停 ⏸"
-    pace = ("全天（每 30 分钟一期）" if not sched.get("enabled", False)
-            else PRESET_ZH.get(sched.get("preset"), sched.get("preset", "-")))
+    # P-57：节奏/形态行摘除（拉取模式无定时、无稳态形态分歧），改示拉取口令
     return (
-        f"📊 当前状态\n· 推送: {push_state}\n· 节奏: {pace}\n"
-        f"· 形态: {MODE_ZH.get(rep.get('mode'), rep.get('mode', '-'))} · "
-        f"{DMODE_ZH.get(rep.get('display_mode'), rep.get('display_mode', '-'))}\n"
+        f"📊 当前状态\n· 推送: {push_state}\n"
+        f"· 拉取: 发「推送 / 获取 / 新闻」随时抓取推送（无定时）\n"
+        f"· 分组: {DMODE_ZH.get(rep.get('display_mode'), rep.get('display_mode', '-'))}\n"
         f"· 平台: {len(srcs)} 个｜RSS: {n_feed_on}/{len(feeds)} 个\n· 关键词: {n} 词 / {g} 组"
     )
 
@@ -1135,9 +1115,10 @@ def parse_words_structured(fp):
 def export_payload(user_config):
     """读服务端当前配置 → 反向生成 TRCFG1 v1 载荷（P-47「导出配置」）。
     与博客页 diff 约定对齐：freq 词表全量（空词表省略=页面留空=不动词表）；
-    schedule 恒含（页面是单选态，无 diff 语义）；report 仅非页面默认值（current/keyword 不发）；
-    platforms 仅停用项（注释态条目 yaml.safe_load 看不到，扫原文）；rss 全部显式布尔
-    （页面默认可能与上游种子不一致，显式即保真）。只读，不写盘。"""
+    schedule/report.mode 不导出（P-57：拉取模式下页面已无对应控件，导出即虚诺）；
+    report 仅非页面默认值（keyword 不发）；platforms 仅停用项（注释态条目
+    yaml.safe_load 看不到，扫原文）；rss 全部显式布尔（页面默认可能与上游种子
+    不一致，显式即保真）。只读，不写盘。"""
     import yaml
     p = {"v": 1}
     freq = parse_words_structured(user_config / "frequency_words.txt")
@@ -1145,15 +1126,8 @@ def export_payload(user_config):
         p["freq"] = freq
     cfg = yaml.safe_load((user_config / "config.yaml").read_text(encoding="utf-8")) or {}
     out = {}
-    sched = cfg.get("schedule") or {}
-    if sched.get("enabled", False):
-        out["schedule"] = {"enabled": True, "preset": sched.get("preset", "always_on")}
-    else:
-        out["schedule"] = {"enabled": False}
     rep = cfg.get("report") or {}
     rep_out = {}
-    if rep.get("mode") and rep["mode"] != "current":
-        rep_out["mode"] = rep["mode"]
     if rep.get("display_mode") and rep["display_mode"] != "keyword":
         rep_out["display_mode"] = rep["display_mode"]
     if rep_out:
