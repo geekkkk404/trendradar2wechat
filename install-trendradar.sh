@@ -30,6 +30,7 @@
 #    --ai-model MODEL    指定模型，如 deepseek/deepseek-chat、openai/gpt-4o-mini
 #    --no-web            网页报告仅本机可访问（不监听公网）
 #    --with-mcp          同时部署 MCP AI 分析服务（默认不部署）
+#    --enable-timer      启用每 30 分钟定时抓取（仅 --wechat-bridge 拉取模式下需要时用）
 #    --uninstall         停止并移除服务；配合 --purge 同时删除数据
 #    --purge             配合 --uninstall 删除全部数据（含微信绑定凭证与 node/uv 工具）
 #    -h, --help          显示本帮助
@@ -72,7 +73,7 @@ die()  { printf "${C_R}  ❌ %s${C_0}\n" "$*" >&2; exit 1; }
 # ----------------------------- 参数解析 --------------------------------------
 ARG_PORT=""; ARG_DIR=""; ARG_WEWORK=""; ARG_FEISHU=""; ARG_DINGTALK=""
 ARG_TG=""; ARG_NTFY=""; ARG_AIKEY=""; ARG_AIMODEL=""
-NO_WEB=0; WITH_MCP=0; UNINSTALL=0; PURGE=0; WECHAT_BRIDGE="${WECHAT_BRIDGE:-0}"
+NO_WEB=0; WITH_MCP=0; UNINSTALL=0; PURGE=0; TIMER_OPTIN=0; WECHAT_BRIDGE="${WECHAT_BRIDGE:-0}"
 
 show_help() { awk 'NR>2 && /^# ===/ {exit} NR>2 {sub(/^# ?/, ""); print}' "$0"; exit 0; }
 
@@ -89,6 +90,7 @@ while [ $# -gt 0 ]; do
     --ai-model) ARG_AIMODEL="$2"; shift 2 ;;
     --no-web)   NO_WEB=1; shift ;;
     --with-mcp) WITH_MCP=1; shift ;;
+    --enable-timer) TIMER_OPTIN=1; shift ;;
     --wechat-bridge) WECHAT_BRIDGE=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge)    PURGE=1; shift ;;
@@ -351,16 +353,33 @@ else
   # 整目录播种（保持上游 config/ 目录形制）：上游按「与 config.yaml 同目录」解析伴生文件
   # （实测 timeline.yaml 未随迁 → 空模板 + preset 报错），AI 提示词等邻座文件一并外置
   cp -r "$DEST/config/." "$USER_CONFIG/"
+  # TRD2W 默认词表（2026-11-06 站主决策）：上游模板词表含「胖东来/幻方量化」等站长自用词，
+  # 对读者无意义——首装改写为本项目简化默认（AI/科技 starter，精修列为低优先级后续项）。
+  # 仅首装分支内覆盖（升级永不触碰）；微信内可随时发 TRCFG1 或改此文件调整。
+  cat > "$USER_CONFIG/frequency_words.txt" <<'KWEOF'
+[AI 与大模型]
+AI
+人工智能
+大模型
+DeepSeek
+OpenAI
+@5
+
+[马斯克与特斯拉]
+马斯克
+特斯拉
+SpaceX
+@5
+KWEOF
   cat > "$USER_CONFIG/README.txt" <<'MDEOF'
 此目录存放你的个性化配置；重跑安装脚本升级时【不会被覆盖】。
 
-  frequency_words.txt   关注关键词（追什么词、排除什么词）
+  frequency_words.txt   关注关键词（追什么词、排除什么词；默认已按 AI/科技 预置）
   config.yaml           主配置（推送节奏/信息源/报告形态等，文件内含中文注释）
 
-修改后在下次定时抓取（每 30 分钟）自动生效；
-想立即验证请在终端执行: systemctl start trendradar-fetch
+修改后下次抓取自动生效；微信里发「推送」可立即抓取并推送。
 MDEOF
-  ok "用户配置已初始化（$USER_CONFIG，升级不覆盖）"
+  ok "用户配置已初始化（$USER_CONFIG，升级不覆盖；默认关键词已按 AI/科技 预置）"
 fi
 # AI 分析默认关闭（P-44）：上游两级开关默认全开——ai.enabled 总开关 + regions.ai_analysis
 # 显示开关。无 AI Key 的读者每期推送都带「⚠️ AI 分析失败」且每轮白跑一次 AI 调用。
@@ -467,7 +486,16 @@ fi
 systemctl daemon-reload
 systemctl enable trendradar-web >/dev/null 2>&1
 systemctl restart trendradar-web      # restart 而非 enable --now：重跑改端口/绑定即时生效
-systemctl enable --now trendradar-fetch.timer >/dev/null 2>&1
+# 拉取模式（P-55/P-54，2026-11-06 站主拍板）：桥安装默认不启用定时——bot 上行 token 存在
+# ~30 分钟 TTL（P-55 实锤：用户不说话则定时推送必败）且单方面高频发送有风控面（P-54 实锤）。
+# 微信发「推送 / 获取 / 新闻」即现抓现推（token 新鲜必达）。--enable-timer 可选回定时形态。
+if [ "$WECHAT_BRIDGE" = "1" ] && [ "$TIMER_OPTIN" != "1" ]; then
+  systemctl disable trendradar-fetch.timer >/dev/null 2>&1 || true
+  systemctl stop trendradar-fetch.timer >/dev/null 2>&1 || true
+  ok "拉取模式：定时抓取已停用，微信发「推送 / 获取 / 新闻」即抓即推（--enable-timer 可启用定时）"
+else
+  systemctl enable --now trendradar-fetch.timer >/dev/null 2>&1
+fi
 if [ "$WITH_MCP" = "1" ]; then
   systemctl enable trendradar-mcp >/dev/null 2>&1 && systemctl restart trendradar-mcp && ok "MCP 服务已启动（$MCP_HOST:$MCP_PORT）"
 fi
@@ -1192,12 +1220,13 @@ FETCH_UNIT = "trendradar-fetch"
 
 MENU_BODY = (
     "📖 指令菜单（tr2w 管家）\n"
+    "· 推送 / 获取 / 新闻 —— 立即抓取并推送最新热点\n"
     "· 帮助 —— 本菜单\n"
     "· 状态 —— 当前配置速览\n"
     "· 词表 —— 查看关注关键词\n"
     "· 暂停 / 恢复 —— 停止/恢复推送\n"
-    "· 立即推送 —— 马上抓取并推一期\n"
-    "· 导出配置 —— 重新生成配置链接\n"
+    "· 触发词 —— 查看拉取触发词（加触发词 X / 删触发词 X 可自定义）\n"
+    "· 导出配置 —— 生成配置二维码\n"
     "· TRCFG1:… —— 粘贴配置码（博客可视化页生成），立即生效\n"
     "· 设置AI密钥 sk-xxx —— 开启 AI 热点分析（腾讯 TokenHub 免费额度；结尾加「官方」二字 = DeepSeek 官方）\n"
     "· 测试AI / 删除AI配置 —— 验证 AI 连通 / 关闭并删除 Key\n"
@@ -1337,6 +1366,74 @@ def trigger_fetch(preview=False):
     if m == "current":
         return "⏳ 已触发立即抓取，当前榜单命中内容约 1 分钟送达"
     return "⏳ 已触发立即抓取（按当前推送形态排程推送）"
+
+
+# ============================== 拉取触发词（P-55 拉取模式，2026-11-06 站主拍板） ==============================
+# 拉取模式：定时抓取已停用（token ~30min TTL 使定时推送不可靠 + 单方面发送有风控面），
+# 用户主动发消息 = 新鲜 token = 推送必达。内置触发词不可变动；用户自定义词存
+# user-config/tr2w_triggers.txt（每行一个，升级重跑不覆盖）。词仅做整串匹配，无注入面。
+BUILTIN_TRIGGERS = ("推送", "获取", "新闻")
+TRIGGER_FILE = USER_CONFIG / "tr2w_triggers.txt"
+
+
+def pull_triggers():
+    """内置 + 自定义触发词（自定义读文件，逐行 trim，去重保序）。"""
+    custom = []
+    try:
+        for ln in TRIGGER_FILE.read_text(encoding="utf-8").splitlines():
+            w = ln.strip()
+            if w and w not in custom:
+                custom.append(w)
+    except FileNotFoundError:
+        pass
+    out = list(BUILTIN_TRIGGERS)
+    for w in custom:
+        if w not in out:
+            out.append(w)
+    return out
+
+
+def cmd_trigger_list():
+    custom = pull_triggers()[len(BUILTIN_TRIGGERS):]
+    if not custom:
+        return "🔔 拉取触发词:\n· 内置: " + "、".join(BUILTIN_TRIGGERS) + "\n· 自定义: 无（发「加触发词 词汇」添加，每次一个）"
+    return ("🔔 拉取触发词:\n· 内置: " + "、".join(BUILTIN_TRIGGERS) +
+            "\n· 自定义: " + "、".join(custom))
+
+
+def cmd_trigger_add(rest):
+    w = rest.strip()
+    if not w or len(w) > 20 or "\n" in w:
+        return "❌ 用法: 加触发词 词汇（≤20 字，每次一个）"
+    cur = pull_triggers()
+    if w in cur:
+        return f"「{w}」已是触发词（无需重复添加）"
+    lines = []
+    try:
+        lines = [l.strip() for l in TRIGGER_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+    except FileNotFoundError:
+        lines = []
+    lines.append(w)
+    TRIGGER_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return f"✅ 已添加触发词「{w}」——以后发「{w}」即可拉取最新热点"
+
+
+def cmd_trigger_del(rest):
+    w = rest.strip()
+    if w in BUILTIN_TRIGGERS:
+        return f"「{w}」是内置触发词，不可删除"
+    try:
+        lines = [l.strip() for l in TRIGGER_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+    except FileNotFoundError:
+        lines = []
+    if w not in lines:
+        return f"「{w}」不在自定义触发词里（发「触发词」查看）"
+    lines = [l for l in lines if l != w]
+    if lines:
+        TRIGGER_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    else:
+        TRIGGER_FILE.unlink(missing_ok=True)
+    return f"✅ 已删除触发词「{w}」"
 
 
 # ============================== 配置载荷 zlib（P-53，D14 预留兑现） ==============================
@@ -1602,12 +1699,18 @@ def dispatch(text):
     if t == "恢复":
         changes = apply_trcfg.toggle_push(True, USER_CONFIG)
         return "▶️ 推送已恢复"
-    if t == "立即推送":
-        return trigger_fetch(preview=apply_trcfg.has_keywords(USER_CONFIG))
     if t in ("测试ai", "测试"):
         return cmd_test_ai()
     if t in ("删除ai配置", "关闭ai"):
         return cmd_del_ai()
+    if t.startswith("加触发词"):
+        return cmd_trigger_add(t[len("加触发词"):])
+    if t.startswith("删触发词"):
+        return cmd_trigger_del(t[len("删触发词"):])
+    if t in ("触发词", "触发词列表"):
+        return cmd_trigger_list()
+    if t in pull_triggers() or t == "立即推送":
+        return trigger_fetch(preview=apply_trcfg.has_keywords(USER_CONFIG))
     if text.startswith("TRCFG1"):
         return "❌ 配置码格式: 以 TRCFG1: 开头（博客可视化页一键生成）"
     return "没听懂这条指令 🤔 发「帮助」查看我能做什么"
@@ -1755,12 +1858,12 @@ if [ "$NO_WEB" = "0" ]; then
 else
   echo "    🔒 仅本机模式: 未开放任何入站端口（报告在 $DEST/output/，服务器本机可见）"
 fi
-if [ "$WECHAT_BRIDGE" = "1" ] && [ "$BRIDGE_OK" = "1" ]; then
+    if [ "$WECHAT_BRIDGE" = "1" ] && [ "$BRIDGE_OK" = "1" ]; then
   echo "    📱 微信推送: any2wechat 桥已部署（TrendRadar 通用 webhook 已指向桥）"
     if [ "$BRIDGE_AUTHED" = "1" ]; then
       echo "       ▶ 最后一步: 在微信里给 bot 发任意一条消息（如「绑定」）即完成绑定"
-      echo "         bot 会话可在微信通讯录里找到（授权时创建）；收到「✅ 绑定成功」回执后，热点日报直达微信"
-      echo "         想立刻收第一期: systemctl start trendradar-fetch"
+      echo "         bot 会话可在微信通讯录里找到（授权时创建）；收到「✅ 绑定成功」回执后即可使用"
+      echo "         想立刻收第一期: 在微信里发「推送」（也可用「获取」/「新闻」）"
     else
       echo "       ▶ 微信授权尚未完成，在服务器终端补做（复制整段执行）:"
       echo "         cd $A2W_SRC && BRIDGE_DATA_DIR=$A2W_DATA node bin/login.mjs"
@@ -1776,9 +1879,13 @@ else
   echo "       bash install-trendradar.sh --wechat-bridge --no-web"
   echo "       （也支持 --wework / --feishu / --dingtalk / --telegram 'BotToken:ChatID'）"
 fi
-echo "    📖 可视化配置: geekkkk.com/trcfg （生成配置码发微信即生效）｜进阶: docs/config-guide.md"
+echo "    📖 可视化配置: geekkkk.com/trcfg （浏览器打开，粘贴配置码即可视化编辑）｜进阶: docs/config-guide.md"
 echo "    🔧 查看抓取日志: journalctl -u trendradar-fetch -n 50   （跟踪 -f）"
-echo "    ⏰ 定时任务:     systemctl list-timers trendradar-fetch*"
+if [ "$WECHAT_BRIDGE" = "1" ] && [ "$TIMER_OPTIN" != "1" ]; then
+  echo "    ⏰ 抓取模式:     拉取式——微信发「推送 / 获取 / 新闻」即抓即推（--enable-timer 可启用 30 分钟定时）"
+else
+  echo "    ⏰ 定时任务:     systemctl list-timers trendradar-fetch*"
+fi
 echo "    🔄 升级更新:     重跑本脚本即可（幂等，保留配置与数据；含 --wechat-bridge 时桥同步更新）"
 echo "    🗑  停止卸载:     bash install-trendradar.sh --uninstall（彻底删除含微信凭证用 --uninstall --purge）"
 if [ "$NO_WEB" = "0" ]; then
