@@ -353,33 +353,46 @@ else
   # 整目录播种（保持上游 config/ 目录形制）：上游按「与 config.yaml 同目录」解析伴生文件
   # （实测 timeline.yaml 未随迁 → 空模板 + preset 报错），AI 提示词等邻座文件一并外置
   cp -r "$DEST/config/." "$USER_CONFIG/"
-  # TRD2W 默认词表（2026-11-06 站主决策）：上游模板词表含「胖东来/幻方量化」等站长自用词，
-  # 对读者无意义——首装改写为本项目简化默认（AI/科技 starter，精修列为低优先级后续项）。
-  # 仅首装分支内覆盖（升级永不触碰）；微信内可随时发 TRCFG1 或改此文件调整。
+  # TRD2W 默认信息源模板（2026-11-07 站主拍板，P-60 词表精修）：首装=「全网热点」——
+  # 原生热榜直出 + 六大热点平台 + 按来源分组。热点速览兜底组是限流阀：空词表会全量推送
+  # （上游 frequency.py `if not word_groups: return True` 实锤），六平台全量≈5-6 批连发
+  # 贴风控红线（P-54 教训），@20 压回 1-2 批。仅首装分支内覆盖（升级永不触碰）；
+  # trcfg 页可一键换其余三套模板（极客开发/商业财经/硬新闻脱水）或自由增删。
   cat > "$USER_CONFIG/frequency_words.txt" <<'KWEOF'
-[AI 与大模型]
-AI
-人工智能
-大模型
-DeepSeek
-OpenAI
-@5
+# 本文件由配置系统维护：微信 TRCFG1 应用时会整体重写本文件（手工微调会被下次应用覆盖）。
 
-[马斯克与特斯拉]
-马斯克
-特斯拉
-SpaceX
-@5
+[GLOBAL_FILTER]
+
+[WORD_GROUPS]
+
+[热点速览]
+/./
+@20
 KWEOF
+  # 模板手术（对上游 config.yaml 原文，形制与管家 apply_trcfg 严格一致，trcfg 可随时改回）：
+  # ① 平台停用=注释 sources 条目（保留 name/domain 便于回启，同 _toggle_platform）
+  awk '
+    /^ *- id: "(wallstreetcn-hot|thepaper|cls-hot|ifeng|tieba)"$/ { skip = 1 }
+    skip && /^ *- id:/ && !/^ *- id: "(wallstreetcn-hot|thepaper|cls-hot|ifeng|tieba)"$/ { skip = 0 }
+    skip && /^ *$/ { skip = 0 }
+    skip { print "# " $0; next }
+    { print }
+  ' "$USER_CONFIG/config.yaml" > /tmp/tr-seed-awk.$$ && mv /tmp/tr-seed-awk.$$ "$USER_CONFIG/config.yaml"
+  # ② RSS 停用=无 enabled 行的源补 enabled: false（同 _toggle_feed 缺行补法；阮一峰上游本就 false）
+  sed -i '\|url: "https://hnrss.org/frontpage"|a\      enabled: false                  # 停用（默认模板，trcfg 可改回）' "$USER_CONFIG/config.yaml"
+  sed -i '\|url: "https://finance.yahoo.com/news/rssindex"|a\      enabled: false                  # 停用（默认模板，trcfg 可改回）' "$USER_CONFIG/config.yaml"
+  # ③ 按来源分组（模板语义：微博吵什么/抖音看什么一眼分层）
+  sed -i 's|^\(  display_mode: \)"keyword"|\1"platform"|' "$USER_CONFIG/config.yaml"
   cat > "$USER_CONFIG/README.txt" <<'MDEOF'
 此目录存放你的个性化配置；重跑安装脚本升级时【不会被覆盖】。
 
-  frequency_words.txt   关注关键词（追什么词、排除什么词；默认已按 AI/科技 预置）
+  frequency_words.txt   关注关键词（默认=「全网热点」模板：热榜直出、每轮最多 20 条）
   config.yaml           主配置（信息源/推送分组等，文件内含中文注释）
 
-修改后下次抓取自动生效；微信里发「推送」可立即抓取并推送。
+修改后下次抓取自动生效；微信里发「推送」可立即抓取并推送；
+打开 geekkkk.com/trcfg 可一键换模板（极客开发/商业财经/硬新闻脱水）或自由配置。
 MDEOF
-  ok "用户配置已初始化（$USER_CONFIG，升级不覆盖；默认关键词已按 AI/科技 预置）"
+  ok "用户配置已初始化（$USER_CONFIG，升级不覆盖；默认=全网热点模板：六大平台热榜直出、每轮≤20条）"
 fi
 # AI 分析默认关闭（P-44）：上游两级开关默认全开——ai.enabled 总开关 + regions.ai_analysis
 # 显示开关。无 AI Key 的读者每期推送都带「⚠️ AI 分析失败」且每轮白跑一次 AI 调用。
@@ -741,7 +754,7 @@ DMODE_ZH = {"keyword": "按主题分组", "platform": "按来源分组"}
 KEEP_BACKUPS = 30
 _SECTION = re.compile(r"^([A-Za-z_]+):\s*(?:#.*)?$")
 _ENTRY = re.compile(r"^(\s*)- id:\s*[\"']?([A-Za-z0-9_-]+)[\"']?\s*(?:#.*)?$")
-_ENTRY_C = re.compile(r"^(\s*)#\s*- id:\s*[\"']?([A-Za-z0-9_-]+)[\"']?\s*(?:#.*)?$")
+_ENTRY_C = re.compile(r"^(\s*)(?:#\s*)+- id:\s*[\"']?([A-Za-z0-9_-]+)[\"']?\s*(?:#.*)?$")
 # P-56：`/` 前缀放行——它是上游词表 DSL 的正则词条法（/…/ => 别名），官方默认词表 30 词
 # 以此开头，旧规则会拒掉整份默认配置；其余前缀（注释/必须/排除/条数/组头）仍是保留字。
 # 与博客页 chkWord 同规则（geekkkk-site static/trcfg）。
@@ -827,16 +840,24 @@ def _find_block(lines, pid, commented):
 
 
 def _toggle_platform(lines, pid, on, changes):
-    cur = _find_block(lines, pid, commented=not on)
+    # P-60 修复（v0.8.0，2026-11-07 round-trip 测试抓出）：v0.3.0 起两向搜索写反——
+    # 目标态块被当待切换块，真实切换全落空（回执「已是启用/停用」读者无法察觉，
+    # trcfg 页取消勾选平台从未真正生效）；已注释块再停用会被二次注释（# # 前缀令
+    # _ENTRY_C 失配，后续指令报「未知平台」）。恢复语义：目标态命中=无变化；
+    # 相反态命中=执行切换；两态皆无=未知 id。
+    tgt = _find_block(lines, pid, commented=not on)   # 目标态块（on=True→活动块）
+    if tgt is not None:
+        changes.append(f"平台 {pid} 已是{'启用' if on else '停用'}状态（无变化）")
+        return
+    cur = _find_block(lines, pid, commented=on)        # 当前相反态块（待切换）
     if cur is None:
-        if _find_block(lines, pid, commented=on) is not None:
-            changes.append(f"平台 {pid} 已是{'启用' if on else '停用'}状态（无变化）")
-            return
         raise ApplyError(f"未知平台 id: {pid!r}（以 config.yaml 的 sources 为准）")
     start, end, _indent = cur
     if on:
         for i in range(start, end):
-            lines[i] = re.sub(r"^(\s*)#(\s)?", r"\1", lines[i], count=1)
+            # 循环剥标记：单发会留下半修复态（# # → #），顺带治愈历史二次注释伤害
+            while re.match(r"^\s*#", lines[i]):
+                lines[i] = re.sub(r"^(\s*)#(\s)?", r"\1", lines[i], count=1)
         changes.append(f"启用平台 {pid}")
     else:
         for i in range(start, end):
@@ -884,7 +905,7 @@ def _word(w, what):
 def gen_frequency(freq):
     if not isinstance(freq, dict):
         raise ApplyError("freq 必须是对象")
-    out = ["# 本文件由 TRCFG1 生成（微信/网页配置端）。手工微调会在下次 TRCFG1 应用时被覆盖。", ""]
+    out = ["# 本文件由配置系统维护：微信 TRCFG1 应用时会整体重写本文件（手工微调会被下次应用覆盖）。", ""]
     gf = freq.get("global_filter") or []
     out.append("[GLOBAL_FILTER]")
     for w in gf:
@@ -971,7 +992,7 @@ def apply_payload(payload, user_config):
     freq_text = gen_frequency(freq) if freq is not None else None
     freq_changed = freq_text is not None and freq_text != orig_freq
     if not yaml_changed and not freq_changed:
-        return changes or ["载荷与当前配置一致，无变化"]
+        return ["载荷与当前配置一致，无变化"]  # 全 no-op（含「已是 XX 态」项）收口单行，回执如实
     if freq_changed:
         gf_n = len(freq.get("global_filter") or [])
         gs = freq.get("groups") or []

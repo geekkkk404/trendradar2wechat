@@ -19,7 +19,8 @@ curl -fsSL --retry 3 https://geekkkk.com/trendradar.sh -o install.sh && bash ins
 - 全部选项：`bash install.sh --help`
 
 部署后，微信里给 bot 发「帮助」即可对话式管理（暂停/恢复/改配置）；个性化配置推荐用
-可视化配置页 **[geekkkk.com/trcfg](https://geekkkk.com/trcfg/)** 勾选生成配置码，粘贴给 bot 即生效。
+可视化配置页 **[geekkkk.com/trcfg](https://geekkkk.com/trcfg/)**——内置四套人群模板
+（装机默认「全网热点」，另有极客开发/商业财经/硬新闻脱水）一键起步，也可自由勾选生成配置码，粘贴给 bot 即生效。
 
 要求：Ubuntu 20.04+ / Debian 11+（x86_64 / arm64），1GB 内存起，**无需 Docker**
 （Python ≥3.12 由脚本自动准备，Ubuntu 24.04 自带）。
