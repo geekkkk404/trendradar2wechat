@@ -1273,6 +1273,16 @@ def menu_text():
     return MENU_BODY + tail, qr, imgs
 
 
+def welcome_text():
+    """P-64 绑定欢迎语：菜单+状态拼一条 + 配置海报卡（复用帮助媒体出口）。
+    「绑定」是读者与 bot 的第一次对话（P-63 行动卡教的话）——回执即完整指令面，
+    省一次「帮助」往返；此前「绑定」落进 dispatch 兜底回「没听懂」，首触体验断裂。"""
+    body, qr, imgs = menu_text()
+    status = apply_trcfg.config_summary(USER_CONFIG) + "\n" + ai_status_line()
+    head = "👋 你好，我是 TrendRadar 微信管家——热点推送与配置修改都在这里完成！\n\n"
+    return head + body + "\n\n📌 当前状态：\n" + status, qr, imgs
+
+
 # ============================== P-61 海报配置卡（C 款，2026-11-07 站主选定） ==============================
 # 装饰条（蓝渐变头条+深色页脚）烤死在 tr2w/assets/；中段 Pillow 实时绘制（QR+摘要，2x 合成）。
 # 任一环缺失（资产/字体/PIL/qrcode/异常）→ _poster_compose 返回 None → 调用方回退纯 QR。
@@ -1962,6 +1972,8 @@ def dispatch(text):
         return cmd_trigger_list()
     if t in pull_triggers() or t == "立即推送":
         return trigger_fetch(preview=apply_trcfg.has_keywords(USER_CONFIG))
+    if t in ("绑定", "开始", "start"):
+        return welcome_text()  # P-64：绑定欢迎语=菜单+状态+海报卡（放在触发词之后：自定义触发词「绑定」拉取意图优先）
     if text.startswith("TRCFG1"):
         return "❌ 配置码格式: 以 TRCFG1: 开头（博客可视化页一键生成）"
     return "没听懂这条指令 🤔 发「帮助」查看我能做什么"
@@ -2152,3 +2164,18 @@ if [ "$NO_WEB" = "0" ]; then
   esac
 fi
 echo "  ═══════════════════════════════════════════════════════"
+
+# P-63 绑定行动卡（A 方案）：全场最后一块输出——此前「发绑定」埋在 20+ 行摘要中部，
+# 零基础读者扫一眼抓不住下一步。已绑定（session.json 在）→ 引导收第一期；未绑定 → 引导绑定。
+if [ "$WECHAT_BRIDGE" = "1" ] && [ "$BRIDGE_OK" = "1" ] && [ "$BRIDGE_AUTHED" = "1" ]; then
+  echo ""
+  echo "  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [ -f "$A2W_DATA/session.json" ]; then
+    echo "  ┃  ✅ 微信已绑定。打开微信 → 给 bot 发「推送」立刻看第一期！"
+    echo "  ┃     发「帮助」查看全部指令；可视化配置 geekkkk.com/trcfg"
+  else
+    echo "  ┃  📱 最后一步：打开微信 → 通讯录找 bot → 发「绑定」"
+    echo "  ┃     收到「✅ 绑定成功」回执后，发「推送」立刻看第一期热点！"
+  fi
+  echo "  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+fi
