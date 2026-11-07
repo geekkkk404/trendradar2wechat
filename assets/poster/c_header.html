@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 720px; height: 150px; overflow: hidden; position: relative;
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  .head { background: linear-gradient(135deg, #2563eb 0%, #1e40af 100%); color: #fff;
+    width: 100%; height: 100%; position: relative; overflow: hidden; }
+  .ring { position: absolute; right: -60px; top: -90px; width: 280px; height: 280px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,.18); box-shadow: 0 0 0 44px rgba(255,255,255,.07), 0 0 0 88px rgba(255,255,255,.05); }
+  .ring::after { content: ""; position: absolute; left: 46px; top: 128px; width: 10px; height: 10px;
+    border-radius: 50%; background: #fff; opacity: .9; }
+  .brand { font-size: 35px; font-weight: 700; letter-spacing: .5px; position: absolute; left: 48px; top: 34px; }
+  .sub { font-size: 21px; color: rgba(255,255,255,.75); margin-top: 8px; position: absolute; left: 48px; top: 88px; }
+  /* 时间戳区留白：右下 (right 48 / bottom 30) 由运行时绘制 */
+</style>
+</head>
+<body>
+  <div class="head">
+    <div class="ring"></div>
+    <div class="brand">TrendRadar</div>
+    <div class="sub">热点雷达 · 我的配置卡</div>
+  </div>
+</body>
+</html>
