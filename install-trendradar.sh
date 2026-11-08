@@ -657,23 +657,11 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable any2wechat >/dev/null 2>&1
-    systemctl restart any2wechat   # restart 而非 enable --now：升级重跑载入新代码（P-41㊀）；未授权时亦无害
-
-    if [ "$BRIDGE_AUTHED" = "1" ]; then
-      BH="fail"
-      for i in $(seq 1 12); do
-        bcode=$(curl -sm2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$A2W_PORT/health" 2>/dev/null) || bcode="000"
-        if [ "$bcode" != "000" ]; then BH="ok"; break; fi
-        sleep 5
-      done
-      if [ "$BH" = "ok" ]; then
-        ok "桥服务就绪（127.0.0.1:$A2W_PORT）"
-      else
-        warn "桥服务未就绪，稍后查看: journalctl -u any2wechat -n 20"
-      fi
-    else
-      ok "桥服务已注册（待微信授权后自动上线，期间每 30 秒重试属正常）"
-    fi
+    # P-64㊁（v0.9.2）：此处只 enable 不启动——桥若先于管家运行，读者扫码即发「绑定」时
+    # 首绑消息的转发会撞上管家未就绪窗口（安装收尾两者启动间隔 ~10s，2026-11-08 真机实锤
+    # 欢迎语永久丢失）。启动挪至管家 restart 之后（对调消除窗口本体；桥 relay 失败重试
+    # v0.4.7 为运行期兜底）。restart 而非 enable --now 的升级载新语义保持（P-41㊀）。
+    ok "桥服务已注册（启动安排在管家就绪之后）"
   fi
 fi
 
@@ -2101,9 +2089,29 @@ EOF
     systemctl restart tr2w-handler   # restart 而非 enable --now：升级重跑载入新代码（P-41㊀ 实锤：stale 进程曾静默丢 sch 段）
     sleep 2
     if curl -sm2 "http://127.0.0.1:$TR2W_PORT/health" 2>/dev/null | grep -q '"ok":true'; then
-      ok "管家已上线（微信里给 bot 发『帮助』查看指令菜单）"
+      ok "管家已上线"
     else
       warn "管家未就绪（不影响推送本体；查看: journalctl -u tr2w-handler -n 20）"
+    fi
+    # P-64㊁（v0.9.2）：桥启动安排在管家就绪之后——读者按摘要发「绑定」时管家必然已在位，
+    # 首绑欢迎语不再撞启动竞态；「绑定后教什么」的引导全归微信端欢迎语（P-63 重开边界）
+    if [ "$BRIDGE_OK" = "1" ]; then
+      systemctl restart any2wechat   # restart 而非 enable --now：升级重跑载入新代码（P-41㊀）；未授权时亦无害
+      if [ "$BRIDGE_AUTHED" = "1" ]; then
+        BH="fail"
+        for i in $(seq 1 12); do
+          bcode=$(curl -sm2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$A2W_PORT/health" 2>/dev/null) || bcode="000"
+          if [ "$bcode" != "000" ]; then BH="ok"; break; fi
+          sleep 5
+        done
+        if [ "$BH" = "ok" ]; then
+          ok "桥服务就绪（127.0.0.1:$A2W_PORT）"
+        else
+          warn "桥服务未就绪，稍后查看: journalctl -u any2wechat -n 20"
+        fi
+      else
+        ok "桥服务已注册（待微信授权后自动上线，期间每 30 秒重试属正常）"
+      fi
     fi
   fi
 fi
@@ -2153,15 +2161,13 @@ fi
     if [ "$BRIDGE_AUTHED" = "1" ]; then
       echo "       ▶ 最后一步: 在微信里给 bot 发任意一条消息（如「绑定」）即完成绑定"
       echo "         bot 会话可在微信通讯录里找到（授权时创建）；收到「✅ 绑定成功」回执后即可使用"
-      echo "         想立刻收第一期: 在微信里发「推送」（也可用「获取」/「新闻」）"
     else
       echo "       ▶ 微信授权尚未完成，在服务器终端补做（复制整段执行）:"
       echo "         cd $A2W_SRC && BRIDGE_DATA_DIR=$A2W_DATA node bin/login.mjs"
       echo "         授权成功后，在微信里给 bot 发任意一条消息（如「绑定」）即完成绑定"
     fi
       echo "       ▶ 桥日志: journalctl -u any2wechat -f"
-      echo "       💬 微信指令: 给 bot 发『帮助』查看菜单（改配置/暂停/恢复/词表/状态）"
-      echo "       🤖 AI 热点分析: 微信发『设置AI密钥 sk-你的密钥』开启（腾讯 TokenHub 免费额度，步骤见 geekkkk.com/trcfg）"
+      echo "       💬 绑定后的一切指令与配置引导，bot 会以欢迎语送达微信（P-63 边界：SSH 只教到发绑定）"
 elif [ -n "$CHANNELS" ]; then
   echo "    📱 已配置推送:$CHANNELS"
 else
@@ -2187,17 +2193,15 @@ if [ "$NO_WEB" = "0" ]; then
 fi
 echo "  ═══════════════════════════════════════════════════════"
 
-# P-63 绑定行动卡（A 方案）：全场最后一块输出——此前「发绑定」埋在 20+ 行摘要中部，
-# 零基础读者扫一眼抓不住下一步。已绑定（session.json 在）→ 引导收第一期；未绑定 → 引导绑定。
+# P-63 绑定行动卡（A 方案；2026-11-08 重开收边=方案 b）：全场最后一块输出。SSH 端义务
+# 止于「强烈提醒发绑定」；绑定之后的一切交互引导归微信端欢迎语（P-64），摘要不再教发推送/指令。
 if [ "$WECHAT_BRIDGE" = "1" ] && [ "$BRIDGE_OK" = "1" ] && [ "$BRIDGE_AUTHED" = "1" ]; then
   echo ""
   echo "  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   if [ -f "$A2W_DATA/session.json" ]; then
-    echo "  ┃  ✅ 微信已绑定。打开微信 → 给 bot 发「推送」立刻看第一期！"
-    echo "  ┃     发「帮助」查看全部指令；可视化配置 geekkkk.com/trcfg"
+    echo "  ┃  ✅ 微信已绑定"
   else
     echo "  ┃  📱 最后一步：打开微信 → 通讯录找 bot → 发「绑定」"
-    echo "  ┃     收到「✅ 绑定成功」回执后，发「推送」立刻看第一期热点！"
   fi
   echo "  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 fi
