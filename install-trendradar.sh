@@ -755,6 +755,7 @@ KEEP_BACKUPS = 30
 _SECTION = re.compile(r"^([A-Za-z_]+):\s*(?:#.*)?$")
 _ENTRY = re.compile(r"^(\s*)- id:\s*[\"']?([A-Za-z0-9_-]+)[\"']?\s*(?:#.*)?$")
 _ENTRY_C = re.compile(r"^(\s*)(?:#\s*)+- id:\s*[\"']?([A-Za-z0-9_-]+)[\"']?\s*(?:#.*)?$")
+_FIELD_RE = re.compile(r"^\s*(?:-\s*)?[A-Za-z_][A-Za-z0-9_-]*\s*:")  # 条目/字段行形态（含被注释态），P-65 块边界判定用
 # P-56：`/` 前缀放行——它是上游词表 DSL 的正则词条法（/…/ => 别名），官方默认词表 30 词
 # 以此开头，旧规则会拒掉整份默认配置；其余前缀（注释/必须/排除/条数/组头）仍是保留字。
 # 与博客页 chkWord 同规则（geekkkk-site static/trcfg）。
@@ -835,6 +836,17 @@ def _find_block(lines, pid, commented):
         if _lead(ln) <= base and not ln.lstrip().startswith("#"):
             end = j
             break
+        if ln.lstrip().startswith("#"):
+            # P-65（v0.9.1）注释行收边：只有「剥净注释标记后 = 更深缩进的条目/字段行」才属本块，
+            # 章节段落头（# ===… / # 3. 数据源…）与任意其他注释一律断边。旧实现放行任意注释行，
+            # 末项平台（zhihu）的块会吞下后续 RSS 段落头：停用把它二次注释成 # #（化妆伤），
+            # 启用再被剥标记循环剥光成裸文本 → 非法 YAML → 推送全断
+            t = ln
+            while re.match(r"^\s*#", t):  # 逐枚剥「#␠」标记（保留语义缩进，兼容行首 # 与随缩 # 两种注释态）
+                t = re.sub(r"^(\s*)# ?", r"\1", t, count=1)
+            if not t.strip() or _lead(t) <= base or not _FIELD_RE.match(t):
+                end = j
+                break
         end = j + 1
     return (start, end, indent)
 
@@ -1023,6 +1035,16 @@ def apply_payload(payload, user_config):
     elif freq is not None and yaml_changed:
         changes.append("关注词 → 与当前一致")
 
+    if yaml_changed:
+        # P-65（v0.9.1）落盘前 YAML 门禁：行级手术产物必须先通过整表解析才允许写盘。
+        # 坏结果在此拦截（文件一字不动、备份不做、回执照实报错），根绝「回执绿灯但 config 已死」；
+        # 对既有坏文件（如 P-65 站主箱）同样生效：任何应用都会被拒并如实报错，而非静默继续
+        import yaml
+        try:
+            yaml.safe_load(new_yaml)
+        except yaml.YAMLError as e:
+            first = (str(e).splitlines() or [""])[0][:120]
+            raise ApplyError(f"应用结果未通过 YAML 校验，config.yaml 未做任何改动: {first}")
     _backup(user_config, ["config.yaml", "frequency_words.txt"])
     if yaml_changed:
         config_path.write_text(new_yaml, encoding="utf-8")
