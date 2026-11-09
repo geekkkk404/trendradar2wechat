@@ -24,6 +24,9 @@ curl -fsSL --retry 3 https://geekkkk.com/trendradar.sh -o install.sh && bash ins
 
 要求：Ubuntu 20.04+ / Debian 11+（x86_64 / arm64），1GB 内存起，**无需 Docker**
 （Python ≥3.12 由脚本自动准备，Ubuntu 24.04 自带）。
+
+**已通过部署实测**（2026-11，腾讯云轻量 x86_64）：Ubuntu **20.04 / 22.04 / 24.04 / 26.04** 全系列——
+20.04（Python 3.8）走脚本自动装独立 Python 3.12 路径，26.04（Python 3.14）走系统 Python 直用路径，均含微信桥部署与终端授权二维码。Debian 及 arm64 声明适用但尚未实测。
 TrendRadar 与推送桥由脚本在安装时从各自官方仓库获取并原生部署，本仓库只分发安装脚本与文档。
 
 ## 配置与自定义

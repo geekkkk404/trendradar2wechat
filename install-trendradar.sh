@@ -62,6 +62,12 @@ NODE_VERSION="v22.23.4"
 NODE_MIRROR_CN="https://registry.npmmirror.com/-/binary/node"
 NODE_MIRROR_INTL="https://nodejs.org/dist"
 UV_PY_MIRROR_PROXY="https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download"
+# P-66（v0.9.3）交互终端防 lynx 劫持：上游报告生成后 webbrowser.open(file://)（_should_open_browser
+# =非CI且非Docker，原生部署恒触发且无配置键可关），交互终端（TERM 置位、无 DISPLAY）下 Python
+# 回退注册文本浏览器，腾讯云镜像预装 lynx → 安装期首抓被 lynx 前台接管（2026-11-09 站主真机观测+
+# ssh -tt 复现实锤；OS 无关，v0.2.0 原生时代起必现），摘要/绑定行动卡全部未及展示。$BROWSER 是
+# webbrowser 官方优先消费口：true=静默空操作，零上游改动。
+export BROWSER=true
 
 # ----------------------------- 日志 ------------------------------------------
 C_G="\033[32m"; C_Y="\033[33m"; C_R="\033[31m"; C_B="\033[36m"; C_0="\033[0m"
@@ -406,6 +412,9 @@ fi
 upsert_env "CONFIG_PATH" "$USER_CONFIG/config.yaml"
 upsert_env "FREQUENCY_WORDS_PATH" "$USER_CONFIG/frequency_words.txt"
 upsert_env "PYTHONUNBUFFERED" "1"
+# P-66（v0.9.3）：防 lynx 劫持 belt+braces——systemd 全单元经 EnvironmentFile 消费；安装期首抓
+# 亦经下方「首次抓取」步骤的 set -a 注入生效（systemd 单元无 TERM 本就安全，此行防未来形态）
+upsert_env "BROWSER" "true"
 upsert_env "WEBSERVER_PORT" "$PORT"
 [ -n "$WEWORK" ]   && upsert_env "WEWORK_WEBHOOK_URL"   "$WEWORK"
 [ -n "$FEISHU" ]   && upsert_env "FEISHU_WEBHOOK_URL"   "$FEISHU"
