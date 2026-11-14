@@ -1,0 +1,20 @@
+# trendradar2wechat
+
+> One-command installer that deploys [TrendRadar](https://github.com/sansan0/TrendRadar) — a GitHub/trending hot-topics aggregator — natively on a fresh VPS (no Docker) and delivers daily hot-topic digests straight to the reader's personal WeChat via the [any2wechat](https://github.com/geekkkk404/any2wechat) bridge (WeChat iLink protocol). Zero WeCom, zero ICP filing, zero open inbound ports; fresh VPS ready in ~2 minutes.
+>
+> 一键安装脚本：买台 VPS，一条命令把 TrendRadar 热点日报部署到个人微信推送。无 Docker 原生部署、零企微、零备案、零公网端口，约 2 分钟装完，装完一切在微信对话里管理。
+
+## Docs
+
+- [README 中文](README.md)：快速开始（一条命令）、效果速览、工作原理与设计决策、FAQ、免责声明
+- [README English](README.en.md)：full English translation of the above
+- [微信 iLink bot 协议实战笔记](docs/ilink-protocol-notes.md)： unofficial protocol field notes — QR authorization state machine, sendmessage/getupdates shapes, context_token mechanics (~30 min TTL, echo-verbatim), pull-mode architecture rationale, silent message swallowing fingerprint (ret=0 with no message_id), risk-control lessons
+- [iLink Bot Protocol Field Notes (English)](docs/ilink-protocol-notes.en.md)：English version of the above
+- [配置指南](docs/config-guide.md)：部署后的个性化配置（关键词 DSL、信息源、AI 分析、trcfg 配置页）
+
+## Optional
+
+- [Install script (frozen distribution URL)](https://geekkkk.com/trendradar.sh)：the one-liner `curl -fsSL --retry 3 https://geekkkk.com/trendradar.sh -o install.sh && bash install.sh --wechat-bridge --no-web`
+- [Visual config page](https://geekkkk.com/trcfg/)：WeChat 配置码生成页（纯静态，四套人群模板）
+- [any2wechat](https://github.com/geekkkk404/any2wechat)：the generic "any HTTP project → personal WeChat" push bridge (MIT) that this installer deploys
+- [TrendRadar](https://github.com/sansan0/TrendRadar)：the upstream hot-trends aggregation engine (GPL-3.0, unmodified)

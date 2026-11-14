@@ -77,6 +77,9 @@ any2wechat 桥（Node，仅本机监听 127.0.0.1）
 | **行级手术 + YAML 门禁** | 改配置只动目标行、保留上游全部注释；落盘前 `yaml.safe_load`，坏结果拦截、文件零改动 |
 | **交互终端反劫持** | `$BROWSER` 双保险：治报告生成后 `webbrowser.open` 在 SSH 终端被文本浏览器前台接管 |
 
+协议层细节（QR 授权状态机、context_token 回传机制与 ~30 分钟 TTL 实测、`ret=0` 无 message_id 的静默吞包指纹、风控测试守则）整理成公开笔记：
+**[微信 iLink bot 协议实战笔记](docs/ilink-protocol-notes.md)**（[English](docs/ilink-protocol-notes.en.md)）。
+
 ## 配置与自定义
 
 部署后的个性化（关注关键词、推送分组、信息源取舍）见 **[配置指南](docs/config-guide.md)**。

@@ -75,6 +75,9 @@ Key design decisions (each backed by real measurements):
 | **Line-level patching + YAML gate** | Config edits touch only the target lines and preserve all upstream comments; files pass `yaml.safe_load` before hitting disk — bad results are rejected with zero changes written |
 | **Interactive-terminal un-hijack** | A `$BROWSER` double-guard prevents `webbrowser.open` (after report generation) from hijacking the SSH terminal with a full-screen text browser |
 
+Protocol-level details (QR authorization state machine, the echo-verbatim `context_token` mechanism and its measured ~30-minute TTL, the silent-swallow fingerprint of `ret=0` with no message_id, risk-control testing discipline) are published as field notes:
+**[WeChat iLink Bot Protocol — Field Notes](docs/ilink-protocol-notes.en.md)** ([中文](docs/ilink-protocol-notes.md)).
+
 ## Configuration
 
 After deployment, personalize keywords / grouping / sources via the **[config guide](docs/config-guide.md)** (in Chinese).
